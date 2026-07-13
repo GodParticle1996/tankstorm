@@ -1,0 +1,53 @@
+{
+  "name": "tankstorm",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TankStorm — a modern 2-player turn-based artillery game",
+  "main": "dist-electron/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:electron": "wait-on tcp:5174 && cross-env VITE_DEV_SERVER_URL=http://localhost:5174 electron .",
+    "dev:full": "concurrently -k -n vite,electron -c blue,green \"npm:dev\" \"npm:dev:electron\"",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "electron:build": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-router-dom": "^7.6.1",
+    "three": "^0.177.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.8",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@types/three": "^0.177.0",
+    "@vitejs/plugin-react": "^4.4.1",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^36.0.0",
+    "electron-builder": "^26.0.12",
+    "tailwindcss": "^4.1.8",
+    "typescript": "^5.9.2",
+    "vite": "^6.3.5",
+    "vite-plugin-electron": "^1.1.0",
+    "vitest": "^4.1.10",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.tankstorm.app",
+    "productName": "TankStorm",
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*"
+    ],
+    "directories": {
+      "output": "release"
+    }
+  }
+}

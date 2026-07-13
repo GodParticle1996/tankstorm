@@ -1,0 +1,900 @@
+// ═══════════════════════════════════════════════════════════
+//  GameRenderer — Three.js scene manager (§2.2)
+//  Reads engine state directly every frame. NO React in render path.
+//  Pooled particle system (4000 slots), buffer-attribute terrain updates,
+//  screen shake via camera offset. Disposes everything on unmount.
+//
+//  Camera: fixed orthographic, symmetric frustum, positioned at the
+//  battlefield center (WORLD.WIDTH/2, WORLD.HEIGHT/2). The frustum is
+//  NEVER offset by world coordinates — only camera.position moves
+//  (this is what the screen shake modifies).
+// ═══════════════════════════════════════════════════════════
+
+import * as THREE from "three";
+import { WORLD, PARTICLES } from "../engine/constants";
+import { getWeapon } from "../engine/weapons";
+import { sfx } from "../audio/Sfx";
+import type { GameEngine } from "../engine/GameEngine";
+import type { TankState, ProjectileState, VisualEffect, ScorePopup, ZoneEffect } from "../engine/types";
+
+// Camera base position (battlefield center) — shake jitters around this
+const CAM_X = WORLD.WIDTH / 2;
+const CAM_Y = WORLD.HEIGHT / 2;
+const VIEW_MARGIN = 30;
+// How far below y=0 the terrain mesh skirt extends (covers underground for tall views)
+const TERRAIN_SKIRT_Y = -600;
+// Turret pivot height above tank bottom (must match Physics.getTurretTip)
+const TURRET_PIVOT_Y = WORLD.TANK_HEIGHT + 2;
+
+export class GameRenderer {
+  private renderer: THREE.WebGLRenderer;
+  private scene: THREE.Scene;
+  private camera: THREE.OrthographicCamera;
+  private container: HTMLElement;
+  private engine: GameEngine;
+
+  // Scene objects
+  private terrainMesh: THREE.Mesh;
+  private terrainGeo: THREE.BufferGeometry;
+  private tankGroups: [THREE.Group, THREE.Group];
+  private projectileMeshes: Map<number, THREE.Mesh> = new Map();
+  private trajectoryLine: THREE.Line;
+  private popupGroup: THREE.Group;
+  private skyMesh: THREE.Mesh;
+  private starPoints: THREE.Points;
+
+  // Transient effect meshes (beams, explosion rings) keyed by effect id
+  private beamMeshes: Map<number, THREE.Mesh> = new Map();
+  private ringMeshes: Map<number, THREE.Mesh> = new Map();
+
+  // Pooled particle system (§2.2 — one THREE.Points, 4000 slots)
+  private particleGeo: THREE.BufferGeometry;
+  private particlePositions: Float32Array;
+  private particleColors: Float32Array;
+  private particleLife: Float32Array;
+  private particleMaxLife: Float32Array;
+  private particleVel: Float32Array;
+  private particleMaterial: THREE.PointsMaterial;
+  private particleCount = 0;
+
+  // Screen shake
+  private shakeTrauma = 0;
+
+  private resizeObserver: ResizeObserver;
+
+  constructor(container: HTMLElement, engine: GameEngine) {
+    this.container = container;
+    this.engine = engine;
+
+    // ─── Renderer ───
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // §2.2
+    this.renderer.setSize(container.clientWidth, container.clientHeight);
+    container.appendChild(this.renderer.domElement);
+
+    // ─── Scene ───
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color("#0a0f1e");
+
+    // ─── Orthographic camera (§2.2 — fixed, whole battlefield visible) ───
+    const { viewW, viewH } = this.computeView(container.clientWidth, container.clientHeight);
+    this.camera = new THREE.OrthographicCamera(
+      -viewW / 2, viewW / 2, viewH / 2, -viewH / 2, -500, 500,
+    );
+    this.camera.position.set(CAM_X, CAM_Y, 100);
+
+    // ─── Lighting (tanks are Lambert; terrain is unlit/Basic) ───
+    this.scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.7);
+    dirLight.position.set(200, 400, 300);
+    this.scene.add(dirLight);
+
+    // ─── Sky & stars ───
+    this.skyMesh = this.createSky();
+    this.scene.add(this.skyMesh);
+    this.starPoints = this.createStars();
+    this.scene.add(this.starPoints);
+
+    // ─── Terrain mesh (§2.2 — built once, position buffer rewritten on change) ───
+    this.terrainGeo = new THREE.BufferGeometry();
+    this.terrainMesh = this.createTerrainMesh();
+    this.scene.add(this.terrainMesh);
+
+    // ─── Tanks ───
+    this.tankGroups = [this.createTankModel(0), this.createTankModel(1)];
+    this.scene.add(this.tankGroups[0], this.tankGroups[1]);
+
+    // ─── Trajectory preview line ───
+    const trajGeo = new THREE.BufferGeometry();
+    const trajMat = new THREE.LineDashedMaterial({
+      color: 0x00d4ff,
+      dashSize: 6,
+      gapSize: 5,
+      transparent: true,
+      opacity: 0.55,
+    });
+    this.trajectoryLine = new THREE.Line(trajGeo, trajMat);
+    this.trajectoryLine.visible = false;
+    this.scene.add(this.trajectoryLine);
+
+    // ─── Pooled particle system (§2.2) ───
+    this.particlePositions = new Float32Array(PARTICLES.POOL_SIZE * 3);
+    this.particleColors = new Float32Array(PARTICLES.POOL_SIZE * 3);
+    this.particleLife = new Float32Array(PARTICLES.POOL_SIZE);
+    this.particleMaxLife = new Float32Array(PARTICLES.POOL_SIZE);
+    this.particleVel = new Float32Array(PARTICLES.POOL_SIZE * 3);
+    this.particleCount = 0;
+
+    this.particleGeo = new THREE.BufferGeometry();
+    this.particleGeo.setAttribute("position", new THREE.BufferAttribute(this.particlePositions, 3));
+    this.particleGeo.setAttribute("color", new THREE.BufferAttribute(this.particleColors, 3));
+    this.particleGeo.setDrawRange(0, 0);
+
+    this.particleMaterial = new THREE.PointsMaterial({
+      size: 5,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.9,
+      blending: THREE.AdditiveBlending,
+      sizeAttenuation: false,
+      depthWrite: false,
+    });
+
+    const particlePoints = new THREE.Points(this.particleGeo, this.particleMaterial);
+    particlePoints.frustumCulled = false;
+    this.scene.add(particlePoints);
+
+    // ─── Score popup group ───
+    this.popupGroup = new THREE.Group();
+    this.scene.add(this.popupGroup);
+
+    // ─── Resize observer (§2.2) ───
+    this.resizeObserver = new ResizeObserver(() => this.handleResize());
+    this.resizeObserver.observe(container);
+  }
+
+  // ═════════════════════════════════════════════
+  //  View fitting: show the whole battlefield + margin
+  // ═════════════════════════════════════════════
+
+  private computeView(w: number, h: number): { viewW: number; viewH: number } {
+    const worldW = WORLD.WIDTH + VIEW_MARGIN * 2;
+    const worldH = WORLD.HEIGHT + VIEW_MARGIN * 2;
+    const aspect = w > 0 && h > 0 ? w / h : 16 / 9;
+    let viewW = worldW;
+    let viewH = viewW / aspect;
+    if (viewH < worldH) {
+      viewH = worldH;
+      viewW = viewH * aspect;
+    }
+    return { viewW, viewH };
+  }
+
+  // ═════════════════════════════════════════════
+  //  Sky — gradient by world Y (FrontSide, faces the camera)
+  // ═════════════════════════════════════════════
+
+  private createSky(): THREE.Mesh {
+    const geo = new THREE.PlaneGeometry(WORLD.WIDTH * 6, WORLD.HEIGHT * 10);
+    const mat = new THREE.ShaderMaterial({
+      uniforms: {
+        topColor: { value: new THREE.Color("#070b16") },
+        midColor: { value: new THREE.Color("#151d38") },
+        horizonColor: { value: new THREE.Color("#2b3a63") },
+      },
+      vertexShader: `
+        varying float vWorldY;
+        void main() {
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          vWorldY = wp.y;
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 topColor;
+        uniform vec3 midColor;
+        uniform vec3 horizonColor;
+        varying float vWorldY;
+        void main() {
+          float t1 = clamp(vWorldY / 260.0, 0.0, 1.0);
+          float t2 = clamp((vWorldY - 260.0) / 400.0, 0.0, 1.0);
+          vec3 color = mix(horizonColor, midColor, t1);
+          color = mix(color, topColor, t2);
+          gl_FragColor = vec4(color, 1.0);
+        }
+      `,
+      depthWrite: false,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(WORLD.WIDTH / 2, WORLD.HEIGHT / 2, -250);
+    return mesh;
+  }
+
+  private createStars(): THREE.Points {
+    const COUNT = 110;
+    const positions = new Float32Array(COUNT * 3);
+    for (let i = 0; i < COUNT; i++) {
+      positions[i * 3] = -300 + Math.random() * (WORLD.WIDTH + 600);
+      positions[i * 3 + 1] = 240 + Math.random() * 700;
+      positions[i * 3 + 2] = -200;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    const mat = new THREE.PointsMaterial({
+      size: 2,
+      color: 0xbfd4ff,
+      transparent: true,
+      opacity: 0.7,
+      sizeAttenuation: false,
+      depthWrite: false,
+    });
+    const points = new THREE.Points(geo, mat);
+    points.frustumCulled = false;
+    return points;
+  }
+
+  // ═════════════════════════════════════════════
+  //  Terrain mesh — 4 vertex rows per column:
+  //  grass lip / grass→dirt blend / dirt / deep earth skirt.
+  //  Unlit (MeshBasicMaterial) so colors stay vibrant and predictable.
+  // ═════════════════════════════════════════════
+
+  private static readonly TERRAIN_ROWS = 4;
+
+  private createTerrainMesh(): THREE.Mesh {
+    const cols = this.engine.terrain.cols;
+    const rows = GameRenderer.TERRAIN_ROWS;
+    const positions = new Float32Array(cols * rows * 3);
+    const colors = new Float32Array(cols * rows * 3);
+    const indices: number[] = [];
+
+    for (let i = 0; i < cols - 1; i++) {
+      for (let r = 0; r < rows - 1; r++) {
+        const a = i * rows + r;
+        const b = i * rows + r + 1;
+        const c = (i + 1) * rows + r;
+        const d = (i + 1) * rows + r + 1;
+        indices.push(a, b, c);
+        indices.push(c, b, d);
+      }
+    }
+
+    this.terrainGeo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    this.terrainGeo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    this.terrainGeo.setIndex(indices);
+
+    const material = new THREE.MeshBasicMaterial({
+      vertexColors: true,
+      side: THREE.DoubleSide,
+    });
+
+    const mesh = new THREE.Mesh(this.terrainGeo, material);
+    mesh.name = "terrain";
+    mesh.frustumCulled = false;
+    this.updateTerrainMesh();
+    return mesh;
+  }
+
+  /** Rewrite the position buffer from the engine's heightmap (§2.2) */
+  updateTerrainMesh(): void {
+    const terrain = this.engine.terrain;
+    const cols = terrain.cols;
+    const rows = GameRenderer.TERRAIN_ROWS;
+    const posAttr = this.terrainGeo.getAttribute("position") as THREE.BufferAttribute;
+    const colAttr = this.terrainGeo.getAttribute("color") as THREE.BufferAttribute;
+    const positions = posAttr.array as Float32Array;
+    const colors = colAttr.array as Float32Array;
+
+    const grassLow = new THREE.Color("#4e9a3d");
+    const grassHigh = new THREE.Color("#7ec850");
+    const dirt = new THREE.Color("#8a5a32");
+    const deep = new THREE.Color("#1d1309");
+    const tmp = new THREE.Color();
+
+    for (let i = 0; i < cols; i++) {
+      const x = i * terrain.step;
+      const surfaceY = terrain.surfaceY[i];
+
+      // Grass color varies with elevation for visual interest
+      const hf = Math.max(0, Math.min(1, (surfaceY - 60) / (WORLD.HEIGHT * 0.6)));
+      tmp.copy(grassLow).lerp(grassHigh, hf);
+
+      // Row Ys: surface, surface-6 (grass lip), surface-18 (dirt), deep skirt
+      const ys = [surfaceY, surfaceY - 6, surfaceY - 18, TERRAIN_SKIRT_Y];
+      const rowColors = [tmp, tmp, dirt, deep];
+
+      for (let r = 0; r < rows; r++) {
+        const vi = (i * rows + r) * 3;
+        positions[vi] = x;
+        positions[vi + 1] = ys[r];
+        positions[vi + 2] = 0;
+        colors[vi] = rowColors[r].r;
+        colors[vi + 1] = rowColors[r].g;
+        colors[vi + 2] = rowColors[r].b;
+      }
+    }
+
+    posAttr.needsUpdate = true;
+    colAttr.needsUpdate = true;
+  }
+
+  // ═════════════════════════════════════════════
+  //  Tank models (§2.2 — simple extruded shapes)
+  // ═════════════════════════════════════════════
+
+  private createTankModel(playerIndex: 0 | 1): THREE.Group {
+    const group = new THREE.Group();
+    group.name = `tank_${playerIndex}`;
+    const color = playerIndex === 0 ? 0x3b82f6 : 0xf43f5e;
+    const darkColor = playerIndex === 0 ? 0x1e4a94 : 0x93293c;
+
+    // Tracks / base
+    const trackGeo = new THREE.BoxGeometry(WORLD.TANK_WIDTH + 4, 6, 12);
+    const trackMat = new THREE.MeshLambertMaterial({ color: darkColor });
+    const tracks = new THREE.Mesh(trackGeo, trackMat);
+    tracks.position.y = 3;
+    group.add(tracks);
+
+    // Body
+    const bodyGeo = new THREE.BoxGeometry(WORLD.TANK_WIDTH, 8, 12);
+    const bodyMat = new THREE.MeshLambertMaterial({ color });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    body.name = "body";
+    body.position.y = 10;
+    group.add(body);
+
+    // Turret dome
+    const domeGeo = new THREE.SphereGeometry(6.5, 14, 10);
+    const domeMat = new THREE.MeshLambertMaterial({ color });
+    const dome = new THREE.Mesh(domeGeo, domeMat);
+    dome.scale.y = 0.75;
+    dome.position.y = TURRET_PIVOT_Y - 1;
+    group.add(dome);
+
+    // Barrel — child of group, positioned+rotated around the turret pivot
+    const barrelGeo = new THREE.BoxGeometry(WORLD.TURRET_LENGTH, 3.2, 4);
+    const barrelMat = new THREE.MeshLambertMaterial({ color: 0x59616e });
+    const barrel = new THREE.Mesh(barrelGeo, barrelMat);
+    barrel.name = "barrel";
+    barrel.position.set(WORLD.TURRET_LENGTH / 2, TURRET_PIVOT_Y, -0.5);
+    group.add(barrel);
+
+    // Active player halo — flat ring facing the camera (XY plane)
+    const ringGeo = new THREE.RingGeometry(WORLD.TANK_WIDTH * 0.95, WORLD.TANK_WIDTH * 1.05, 40);
+    const ringMat = new THREE.MeshBasicMaterial({
+      color, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false,
+    });
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.name = "active_ring";
+    ring.position.set(0, 9, -2);
+    group.add(ring);
+
+    // Shield bubble — visible while the tank has shieldHp
+    const shieldGeo = new THREE.RingGeometry(WORLD.TANK_WIDTH * 0.78, WORLD.TANK_WIDTH * 0.92, 40);
+    const shieldMat = new THREE.MeshBasicMaterial({
+      color: 0x60a5fa, transparent: true, opacity: 0,
+      side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    const shield = new THREE.Mesh(shieldGeo, shieldMat);
+    shield.name = "shield_ring";
+    shield.position.set(0, 10, 3);
+    group.add(shield);
+
+    return group;
+  }
+
+  private updateTankModel(group: THREE.Group, tank: TankState, isActive: boolean, timeSec: number): void {
+    group.position.set(tank.x, tank.y, 0);
+
+    // Rotate barrel around the turret pivot (Y-up: angle 0 = right, 90 = up)
+    const angleRad = (tank.angleDeg * Math.PI) / 180;
+    const barrel = group.getObjectByName("barrel") as THREE.Mesh;
+    if (barrel) {
+      barrel.position.x = Math.cos(angleRad) * (WORLD.TURRET_LENGTH / 2);
+      barrel.position.y = TURRET_PIVOT_Y + Math.sin(angleRad) * (WORLD.TURRET_LENGTH / 2);
+      barrel.rotation.z = angleRad;
+    }
+
+    // Pulsing halo for the active tank
+    const ring = group.getObjectByName("active_ring") as THREE.Mesh;
+    if (ring) {
+      const mat = ring.material as THREE.MeshBasicMaterial;
+      mat.opacity = isActive ? 0.4 + 0.18 * Math.sin(timeSec * 5) : 0;
+    }
+
+    // Shield bubble while shieldHp remains
+    const shield = group.getObjectByName("shield_ring") as THREE.Mesh;
+    if (shield) {
+      const mat = shield.material as THREE.MeshBasicMaterial;
+      mat.opacity = tank.shieldHp > 0 ? 0.45 + 0.2 * Math.sin(timeSec * 7) : 0;
+    }
+
+    // Emissive glow when active
+    const body = group.getObjectByName("body") as THREE.Mesh;
+    if (body) {
+      const mat = body.material as THREE.MeshLambertMaterial;
+      mat.emissive.setHex(tank.id === 0 ? 0x3b82f6 : 0xf43f5e);
+      mat.emissiveIntensity = isActive ? 0.35 : 0;
+    }
+  }
+
+  // ═════════════════════════════════════════════
+  //  Projectile rendering (weapon-colored, with particle trails)
+  // ═════════════════════════════════════════════
+
+  private updateProjectiles(projectiles: readonly ProjectileState[]): void {
+    const activeIds = new Set<number>();
+
+    for (const p of projectiles) {
+      activeIds.add(p.id);
+      let mesh = this.projectileMeshes.get(p.id);
+      const weaponColor = getWeapon(p.weaponId)?.color ?? "#ffaa44";
+      if (!mesh) {
+        const geo = new THREE.SphereGeometry(3.5, 8, 8);
+        const mat = new THREE.MeshBasicMaterial({ color: weaponColor });
+        mesh = new THREE.Mesh(geo, mat);
+        this.scene.add(mesh);
+        this.projectileMeshes.set(p.id, mesh);
+      }
+      mesh.position.set(p.x, p.y, 5);
+
+      // Trail: one faint particle per frame at the projectile position
+      this.spawnParticles(p.x, p.y, 1, new THREE.Color(weaponColor), 0, 8, 0.2, 0.35, 0);
+    }
+
+    // Remove dead projectiles
+    for (const [id, mesh] of this.projectileMeshes) {
+      if (!activeIds.has(id)) {
+        this.scene.remove(mesh);
+        mesh.geometry.dispose();
+        (mesh.material as THREE.Material).dispose();
+        this.projectileMeshes.delete(id);
+      }
+    }
+  }
+
+  // ═════════════════════════════════════════════
+  //  Pooled particle system (§2.2 — 4000 slots, reuse dead)
+  // ═════════════════════════════════════════════
+
+  private spawnParticles(
+    x: number, y: number, count: number,
+    color: THREE.Color, speedMin: number, speedMax: number,
+    lifeMin: number, lifeMax: number, gravityScale = 1,
+    upwardBias = 0,
+  ): void {
+    for (let i = 0; i < count; i++) {
+      if (this.particleCount >= PARTICLES.POOL_SIZE) break;
+      const idx = this.particleCount++;
+      const angle = Math.random() * Math.PI * 2;
+      const speed = speedMin + Math.random() * (speedMax - speedMin);
+      const life = lifeMin + Math.random() * (lifeMax - lifeMin);
+
+      this.particlePositions[idx * 3] = x;
+      this.particlePositions[idx * 3 + 1] = y;
+      this.particlePositions[idx * 3 + 2] = 6;
+
+      this.particleVel[idx * 3] = Math.cos(angle) * speed;
+      this.particleVel[idx * 3 + 1] = Math.sin(angle) * speed + upwardBias;
+      // Pack per-particle gravity scale into the unused z-velocity slot
+      this.particleVel[idx * 3 + 2] = gravityScale;
+
+      const heat = Math.random();
+      this.particleColors[idx * 3] = Math.min(1, color.r + heat * 0.35);
+      this.particleColors[idx * 3 + 1] = Math.min(1, color.g + heat * 0.18);
+      this.particleColors[idx * 3 + 2] = Math.min(1, color.b + heat * 0.1);
+
+      this.particleLife[idx] = life;
+      this.particleMaxLife[idx] = life;
+    }
+  }
+
+  private updateParticles(dt: number): void {
+    let writeIdx = 0;
+    for (let i = 0; i < this.particleCount; i++) {
+      this.particleLife[i] -= dt;
+      if (this.particleLife[i] <= 0) continue; // dead slot — skip
+
+      if (i !== writeIdx) {
+        this.particlePositions[writeIdx * 3] = this.particlePositions[i * 3];
+        this.particlePositions[writeIdx * 3 + 1] = this.particlePositions[i * 3 + 1];
+        this.particlePositions[writeIdx * 3 + 2] = this.particlePositions[i * 3 + 2];
+        this.particleVel[writeIdx * 3] = this.particleVel[i * 3];
+        this.particleVel[writeIdx * 3 + 1] = this.particleVel[i * 3 + 1];
+        this.particleVel[writeIdx * 3 + 2] = this.particleVel[i * 3 + 2];
+        this.particleColors[writeIdx * 3] = this.particleColors[i * 3];
+        this.particleColors[writeIdx * 3 + 1] = this.particleColors[i * 3 + 1];
+        this.particleColors[writeIdx * 3 + 2] = this.particleColors[i * 3 + 2];
+        this.particleLife[writeIdx] = this.particleLife[i];
+        this.particleMaxLife[writeIdx] = this.particleMaxLife[i];
+      }
+
+      this.particlePositions[writeIdx * 3] += this.particleVel[writeIdx * 3] * dt;
+      this.particlePositions[writeIdx * 3 + 1] += this.particleVel[writeIdx * 3 + 1] * dt;
+
+      // Gravity (scaled per particle — trails/flames float, debris falls)
+      this.particleVel[writeIdx * 3 + 1] -= 300 * this.particleVel[writeIdx * 3 + 2] * dt;
+
+      // Fade with remaining life
+      const lifeRatio = Math.max(0, this.particleLife[writeIdx] / this.particleMaxLife[writeIdx]);
+      const fade = 0.985 * (0.6 + 0.4 * lifeRatio);
+      this.particleColors[writeIdx * 3] *= fade;
+      this.particleColors[writeIdx * 3 + 1] *= fade;
+      this.particleColors[writeIdx * 3 + 2] *= fade;
+
+      writeIdx++;
+    }
+    this.particleCount = writeIdx;
+
+    (this.particleGeo.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
+    (this.particleGeo.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+    this.particleGeo.setDrawRange(0, this.particleCount);
+  }
+
+  // ═════════════════════════════════════════════
+  //  Visual effects → particles + transient meshes
+  // ═════════════════════════════════════════════
+
+  private processedEffectIds = new Set<number>();
+
+  private processVisualEffects(effects: readonly VisualEffect[]): void {
+    for (const eff of effects) {
+      if (this.processedEffectIds.has(eff.id)) continue;
+      this.processedEffectIds.add(eff.id);
+
+      const color = new THREE.Color(eff.color);
+      switch (eff.type) {
+        case "explosion": {
+          const count = Math.min(PARTICLES.MAX_PER_EXPLOSION, Math.floor(eff.radius * 0.8));
+          this.spawnParticles(eff.x, eff.y, count, color, 60, 220, 0.35, 0.8, 1);
+          this.spawnParticles(eff.x, eff.y, 10, new THREE.Color(0xffffff), 20, 90, 0.1, 0.25, 0.3);
+          this.shakeTrauma = Math.min(1, this.shakeTrauma + eff.radius / 220);
+          sfx.boom(eff.radius);
+          break;
+        }
+        case "dust": {
+          this.spawnParticles(eff.x, eff.y, 14, new THREE.Color(0x9a7b52), 30, 90, 0.25, 0.5, 1, 40);
+          sfx.thud();
+          break;
+        }
+        case "fire": {
+          this.spawnParticles(eff.x, eff.y, 24, color, 15, 60, 0.5, 1.1, -0.15, 30);
+          break;
+        }
+        case "spark": {
+          this.spawnParticles(eff.x, eff.y, 10, color, 80, 170, 0.15, 0.35, 0.6);
+          sfx.pop();
+          break;
+        }
+        case "beam": {
+          // Sparks along the beam; the beam quad itself is drawn in updateBeams
+          const x2 = eff.x2 ?? eff.x;
+          const y2 = eff.y2 ?? eff.y;
+          for (let s = 0; s <= 6; s++) {
+            const t = s / 6;
+            this.spawnParticles(
+              eff.x + (x2 - eff.x) * t, eff.y + (y2 - eff.y) * t,
+              2, color, 10, 50, 0.15, 0.35, 0.2,
+            );
+          }
+          this.shakeTrauma = Math.min(1, this.shakeTrauma + 0.15);
+          sfx.zap();
+          break;
+        }
+      }
+    }
+
+    // Clean up old effect IDs (prevent set from growing forever)
+    if (this.processedEffectIds.size > 300) {
+      this.processedEffectIds.clear();
+      for (const eff of effects) this.processedEffectIds.add(eff.id);
+    }
+  }
+
+  /** Beam quads: created on first sight of a beam effect, faded by age, removed when the effect expires */
+  private updateBeams(effects: readonly VisualEffect[]): void {
+    const activeIds = new Set<number>();
+
+    for (const eff of effects) {
+      if (eff.type !== "beam") continue;
+      activeIds.add(eff.id);
+
+      let mesh = this.beamMeshes.get(eff.id);
+      if (!mesh) {
+        const x2 = eff.x2 ?? eff.x;
+        const y2 = eff.y2 ?? eff.y;
+        const dx = x2 - eff.x;
+        const dy = y2 - eff.y;
+        const len = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+        const width = Math.max(3, eff.radius);
+
+        const geo = new THREE.PlaneGeometry(len, width);
+        const mat = new THREE.MeshBasicMaterial({
+          color: eff.color,
+          transparent: true,
+          opacity: 0.9,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        });
+        mesh = new THREE.Mesh(geo, mat);
+        mesh.position.set(eff.x + dx / 2, eff.y + dy / 2, 6);
+        mesh.rotation.z = Math.atan2(dy, dx);
+        this.scene.add(mesh);
+        this.beamMeshes.set(eff.id, mesh);
+      }
+
+      (mesh.material as THREE.MeshBasicMaterial).opacity = 0.9 * Math.max(0, 1 - eff.age / eff.maxAge);
+    }
+
+    for (const [id, mesh] of this.beamMeshes) {
+      if (!activeIds.has(id)) {
+        this.scene.remove(mesh);
+        mesh.geometry.dispose();
+        (mesh.material as THREE.Material).dispose();
+        this.beamMeshes.delete(id);
+      }
+    }
+  }
+
+  /** Expanding shockwave rings for explosions */
+  private updateExplosionRings(effects: readonly VisualEffect[]): void {
+    const activeIds = new Set<number>();
+
+    for (const eff of effects) {
+      if (eff.type !== "explosion") continue;
+      activeIds.add(eff.id);
+
+      let mesh = this.ringMeshes.get(eff.id);
+      if (!mesh) {
+        const geo = new THREE.RingGeometry(0.82, 1, 40);
+        const mat = new THREE.MeshBasicMaterial({
+          color: eff.color,
+          transparent: true,
+          opacity: 0.85,
+          blending: THREE.AdditiveBlending,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        });
+        mesh = new THREE.Mesh(geo, mat);
+        mesh.position.set(eff.x, eff.y, 5);
+        this.scene.add(mesh);
+        this.ringMeshes.set(eff.id, mesh);
+      }
+
+      const t = Math.min(1, eff.age / Math.min(eff.maxAge, 0.45));
+      const ease = 1 - (1 - t) * (1 - t); // ease-out
+      const scale = Math.max(0.01, eff.radius * ease);
+      mesh.scale.set(scale, scale, 1);
+      (mesh.material as THREE.MeshBasicMaterial).opacity = 0.85 * (1 - t);
+    }
+
+    for (const [id, mesh] of this.ringMeshes) {
+      if (!activeIds.has(id)) {
+        this.scene.remove(mesh);
+        mesh.geometry.dispose();
+        (mesh.material as THREE.Material).dispose();
+        this.ringMeshes.delete(id);
+      }
+    }
+  }
+
+  /** Persistent zone effects (napalm fire, radiation) — ambient flame particles */
+  private updateZoneParticles(zones: readonly ZoneEffect[], dt: number): void {
+    for (const zone of zones) {
+      // ~10 particles/sec per zone, spread across its radius
+      if (Math.random() < dt * 10) {
+        const ox = (Math.random() * 2 - 1) * zone.radius * 0.8;
+        const surfaceY = this.engine.terrain.getSurfaceY(zone.x + ox);
+        const color = new THREE.Color(zone.effect === "fire" ? "#ff6a1a" : "#9be31c");
+        this.spawnParticles(zone.x + ox, surfaceY + 2, 2, color, 5, 25, 0.5, 1.0, -0.25, 35);
+      }
+    }
+  }
+
+  // ═════════════════════════════════════════════
+  //  Trajectory preview (aim line — read from engine.aimReadout)
+  // ═════════════════════════════════════════════
+
+  private updateTrajectory(): void {
+    const readout = this.engine.aimReadout;
+    if (readout.trajectory.length < 2) {
+      this.trajectoryLine.visible = false;
+      return;
+    }
+    this.trajectoryLine.visible = true;
+    const points = readout.trajectory.map((p) => new THREE.Vector3(p.x, p.y, 2));
+    (this.trajectoryLine.geometry as THREE.BufferGeometry).setFromPoints(points);
+    this.trajectoryLine.computeLineDistances();
+  }
+
+  // ═════════════════════════════════════════════
+  //  Score popups (floating text — sprite-based)
+  // ═════════════════════════════════════════════
+
+  private popupSprites: Map<number, THREE.Sprite> = new Map();
+
+  private updatePopups(popups: readonly ScorePopup[]): void {
+    const activeIds = new Set<number>();
+
+    for (const pop of popups) {
+      activeIds.add(pop.id);
+      let sprite = this.popupSprites.get(pop.id);
+      if (!sprite) {
+        const canvas = document.createElement("canvas");
+        canvas.width = 256;
+        canvas.height = 96;
+        const ctx = canvas.getContext("2d")!;
+        ctx.font = "bold 48px system-ui, sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.lineWidth = 8;
+        ctx.strokeStyle = "rgba(0,0,0,0.7)";
+        ctx.strokeText(pop.text, 128, 48);
+        ctx.fillStyle = pop.color;
+        ctx.fillText(pop.text, 128, 48);
+
+        const texture = new THREE.CanvasTexture(canvas);
+        const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
+        sprite = new THREE.Sprite(mat);
+        sprite.scale.set(64, 24, 1);
+        this.popupGroup.add(sprite);
+        this.popupSprites.set(pop.id, sprite);
+      }
+
+      sprite.position.set(pop.x, pop.y, 10);
+      const alpha = Math.max(0, 1 - pop.age / pop.maxAge);
+      (sprite.material as THREE.SpriteMaterial).opacity = alpha;
+    }
+
+    for (const [id, sprite] of this.popupSprites) {
+      if (!activeIds.has(id)) {
+        this.popupGroup.remove(sprite);
+        (sprite.material as THREE.SpriteMaterial).map?.dispose();
+        (sprite.material as THREE.SpriteMaterial).dispose();
+        this.popupSprites.delete(id);
+      }
+    }
+  }
+
+  // ═════════════════════════════════════════════
+  //  Main render frame (called every rAF by the Game page)
+  // ═════════════════════════════════════════════
+
+  private lastFrameTime = 0;
+
+  render(): void {
+    const now = performance.now();
+    const dt = this.lastFrameTime > 0 ? Math.min((now - this.lastFrameTime) / 1000, 0.1) : 0.016;
+    this.lastFrameTime = now;
+    const timeSec = now / 1000;
+
+    // Read engine state directly (NO React)
+    const tanks = this.engine.getTanks();
+    const projectiles = this.engine.getProjectiles();
+    const effects = this.engine.getVisualEffects();
+    const popups = this.engine.getPopups();
+    const zones = this.engine.getZones();
+    const snapshot = this.engine.getSnapshot();
+
+    // Update terrain mesh only when terrain was modified (dirty flag — §2.2)
+    if (this.engine.terrain.dirty) {
+      this.updateTerrainMesh();
+      this.engine.terrain.dirty = false;
+    }
+
+    // Update tanks
+    this.updateTankModel(this.tankGroups[0], tanks[0], snapshot.currentPlayer === 0 && snapshot.phase === "AIMING", timeSec);
+    this.updateTankModel(this.tankGroups[1], tanks[1], snapshot.currentPlayer === 1 && snapshot.phase === "AIMING", timeSec);
+
+    // Update projectiles (+trails)
+    this.updateProjectiles(projectiles);
+
+    // Effects
+    this.processVisualEffects(effects);
+    this.updateBeams(effects);
+    this.updateExplosionRings(effects);
+    this.updateZoneParticles(zones, dt);
+    this.updateParticles(dt);
+
+    // Aim preview + popups
+    this.updateTrajectory();
+    this.updatePopups(popups);
+
+    // Screen shake (§2.2 — camera offset around the base position, trauma² decay)
+    this.shakeTrauma = Math.max(0, this.shakeTrauma - dt * 2);
+    const shake = this.shakeTrauma * this.shakeTrauma;
+    if (shake > 0.01) {
+      this.camera.position.x = CAM_X + (Math.random() - 0.5) * shake * 18;
+      this.camera.position.y = CAM_Y + (Math.random() - 0.5) * shake * 10;
+    } else {
+      this.camera.position.x = CAM_X;
+      this.camera.position.y = CAM_Y;
+    }
+
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  // ═════════════════════════════════════════════
+  //  Resize
+  // ═════════════════════════════════════════════
+
+  private handleResize(): void {
+    const w = this.container.clientWidth;
+    const h = this.container.clientHeight;
+    if (w === 0 || h === 0) return;
+
+    this.renderer.setSize(w, h);
+
+    const { viewW, viewH } = this.computeView(w, h);
+    this.camera.left = -viewW / 2;
+    this.camera.right = viewW / 2;
+    this.camera.top = viewH / 2;
+    this.camera.bottom = -viewH / 2;
+    this.camera.updateProjectionMatrix();
+  }
+
+  // ═════════════════════════════════════════════
+  //  Dispose (§Part 4 item 11 — prevent GPU leaks)
+  // ═════════════════════════════════════════════
+
+  dispose(): void {
+    this.resizeObserver.disconnect();
+
+    for (const [, mesh] of this.projectileMeshes) {
+      this.scene.remove(mesh);
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+    }
+    this.projectileMeshes.clear();
+
+    for (const [, mesh] of this.beamMeshes) {
+      this.scene.remove(mesh);
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+    }
+    this.beamMeshes.clear();
+
+    for (const [, mesh] of this.ringMeshes) {
+      this.scene.remove(mesh);
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+    }
+    this.ringMeshes.clear();
+
+    for (const [, sprite] of this.popupSprites) {
+      this.popupGroup.remove(sprite);
+      (sprite.material as THREE.SpriteMaterial).map?.dispose();
+      (sprite.material as THREE.SpriteMaterial).dispose();
+    }
+    this.popupSprites.clear();
+
+    this.terrainGeo.dispose();
+    (this.terrainMesh.material as THREE.Material).dispose();
+
+    this.skyMesh.geometry.dispose();
+    (this.skyMesh.material as THREE.Material).dispose();
+
+    this.starPoints.geometry.dispose();
+    (this.starPoints.material as THREE.Material).dispose();
+
+    this.particleGeo.dispose();
+    this.particleMaterial.dispose();
+
+    (this.trajectoryLine.geometry as THREE.BufferGeometry).dispose();
+    (this.trajectoryLine.material as THREE.Material).dispose();
+
+    for (const group of this.tankGroups) {
+      group.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          obj.geometry.dispose();
+          (obj.material as THREE.Material).dispose();
+        }
+      });
+    }
+
+    this.renderer.dispose();
+    if (this.renderer.domElement.parentElement === this.container) {
+      this.container.removeChild(this.renderer.domElement);
+    }
+  }
+}
