@@ -150,7 +150,9 @@ export class GameEngine {
   setAngle(deg: number): void {
     if (this.state.phase !== "AIMING") return;
     const tank = this.state.tanks[this.state.currentPlayer];
-    tank.angleDeg = Math.max(0, Math.min(180, deg));
+    // Full 360° turret rotation — wrap instead of clamping to the upper
+    // semicircle, so shooting backwards (or even into the ground) is allowed
+    tank.angleDeg = ((deg % 360) + 360) % 360;
     this.updateAimReadout();
   }
 

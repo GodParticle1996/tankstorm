@@ -30,9 +30,10 @@ function AimReadoutPanel({ player }: { player: 0 | 1 }) {
     const tick = () => {
       raf = requestAnimationFrame(tick);
       const a = engine.aimReadout;
-      // Show elevation from the horizontal so 45° means the same thing to both players
-      const elevation = player === 1 ? 180 - a.angleDeg : a.angleDeg;
-      if (angleRef.current) angleRef.current.textContent = `${Math.round(elevation)}°`;
+      // Player-relative angle over the full 360° range: for both players
+      // 0° = toward the enemy, 90° = straight up, 180° = backwards
+      const display = player === 1 ? (540 - a.angleDeg) % 360 : a.angleDeg;
+      if (angleRef.current) angleRef.current.textContent = `${Math.round(display)}°`;
       if (powerRef.current) powerRef.current.textContent = `${Math.round(a.power)}`;
       if (barRef.current) barRef.current.style.width = `${Math.max(0, Math.min(100, a.power))}%`;
     };

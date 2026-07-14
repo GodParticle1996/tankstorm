@@ -96,6 +96,12 @@ export class GameRenderer {
     this.scene.add(this.starPoints);
 
     // ─── Terrain mesh (§2.2 — built once, position buffer rewritten on change) ───
+    // Surface line + speckles are created first so the initial
+    // updateTerrainMesh() inside createTerrainMesh() populates them too.
+    this.surfaceLine = this.createSurfaceLine();
+    this.scene.add(this.surfaceLine);
+    this.specklePoints = this.createSpeckles();
+    this.scene.add(this.specklePoints);
     this.terrainGeo = new THREE.BufferGeometry();
     this.terrainMesh = this.createTerrainMesh();
     this.scene.add(this.terrainMesh);
@@ -234,12 +240,30 @@ export class GameRenderer {
   }
 
   // ═════════════════════════════════════════════
-  //  Terrain mesh — 4 vertex rows per column:
-  //  grass lip / grass→dirt blend / dirt / deep earth skirt.
+  //  Terrain mesh — 6 vertex rows per column:
+  //  bright grass / grass shadow / light dirt / mid dirt / dark dirt / deep
+  //  skirt, with deterministic per-column color jitter so the ground reads
+  //  as textured earth instead of a flat gradient.
   //  Unlit (MeshBasicMaterial) so colors stay vibrant and predictable.
   // ═════════════════════════════════════════════
 
-  private static readonly TERRAIN_ROWS = 4;
+  private static readonly TERRAIN_ROWS = 6;
+
+  /** Deterministic per-column hash in [0,1) — stable across terrain updates */
+  private static colHash(i: number): number {
+    const s = Math.sin(i * 127.1 + 311.7) * 43758.5453;
+    return s - Math.floor(s);
+  }
+
+  /** Smooth value noise over columns — adjacent columns stay correlated so
+   *  color variation reads as mottled earth, not vertical stripes. */
+  private static smoothNoise(i: number, scale: number): number {
+    const x = i / scale;
+    const i0 = Math.floor(x);
+    const f = x - i0;
+    const t = f * f * (3 - 2 * f);
+    return GameRenderer.colHash(i0) * (1 - t) + GameRenderer.colHash(i0 + 1) * t;
+  }
 
   private createTerrainMesh(): THREE.Mesh {
     const cols = this.engine.terrain.cols;
@@ -285,23 +309,36 @@ export class GameRenderer {
     const positions = posAttr.array as Float32Array;
     const colors = colAttr.array as Float32Array;
 
-    const grassLow = new THREE.Color("#4e9a3d");
-    const grassHigh = new THREE.Color("#7ec850");
-    const dirt = new THREE.Color("#8a5a32");
-    const deep = new THREE.Color("#1d1309");
-    const tmp = new THREE.Color();
+    const grassLow = new THREE.Color("#55a03f");
+    const grassHigh = new THREE.Color("#82ce54");
+    const grassDark = new THREE.Color("#39702c");
+    const dirtLight = new THREE.Color("#9a6b3d");
+    const dirtMid = new THREE.Color("#6e4a28");
+    const dirtDark = new THREE.Color("#3a2614");
+    const deep = new THREE.Color("#150d06");
+    const grass = new THREE.Color();
+    const jittered = new THREE.Color();
 
     for (let i = 0; i < cols; i++) {
       const x = i * terrain.step;
       const surfaceY = terrain.surfaceY[i];
+      // Two octaves of smooth noise: broad patches + fine grain, ±6%
+      const n = GameRenderer.smoothNoise(i, 26) * 0.7 + GameRenderer.smoothNoise(i + 5000, 7) * 0.3;
+      const jitter = 0.94 + n * 0.12;
 
-      // Grass color varies with elevation for visual interest
+      // Grass color varies with elevation + per-column jitter
       const hf = Math.max(0, Math.min(1, (surfaceY - 60) / (WORLD.HEIGHT * 0.6)));
-      tmp.copy(grassLow).lerp(grassHigh, hf);
+      grass.copy(grassLow).lerp(grassHigh, hf).multiplyScalar(jitter);
 
-      // Row Ys: surface, surface-6 (grass lip), surface-18 (dirt), deep skirt
-      const ys = [surfaceY, surfaceY - 6, surfaceY - 18, TERRAIN_SKIRT_Y];
-      const rowColors = [tmp, tmp, dirt, deep];
+      const ys = [surfaceY, surfaceY - 5, surfaceY - 13, surfaceY - 55, surfaceY - 150, TERRAIN_SKIRT_Y];
+      const rowColors = [
+        grass,
+        grassDark,
+        jittered.copy(dirtLight).multiplyScalar(jitter),
+        dirtMid,
+        dirtDark,
+        deep,
+      ];
 
       for (let r = 0; r < rows; r++) {
         const vi = (i * rows + r) * 3;
@@ -316,6 +353,81 @@ export class GameRenderer {
 
     posAttr.needsUpdate = true;
     colAttr.needsUpdate = true;
+
+    this.updateSurfaceLine();
+    this.updateSpeckles();
+  }
+
+  // ─── Surface highlight: thin sunlit line tracing the terrain silhouette ───
+
+  private surfaceLine!: THREE.Line;
+
+  private createSurfaceLine(): THREE.Line {
+    const cols = this.engine.terrain.cols;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(cols * 3), 3));
+    const mat = new THREE.LineBasicMaterial({
+      color: 0xc8f09a, transparent: true, opacity: 0.5, depthWrite: false,
+    });
+    const line = new THREE.Line(geo, mat);
+    line.frustumCulled = false;
+    return line;
+  }
+
+  private updateSurfaceLine(): void {
+    if (!this.surfaceLine) return;
+    const terrain = this.engine.terrain;
+    const attr = this.surfaceLine.geometry.getAttribute("position") as THREE.BufferAttribute;
+    const arr = attr.array as Float32Array;
+    for (let i = 0; i < terrain.cols; i++) {
+      arr[i * 3] = i * terrain.step;
+      arr[i * 3 + 1] = terrain.surfaceY[i] + 0.6;
+      arr[i * 3 + 2] = 1;
+    }
+    attr.needsUpdate = true;
+  }
+
+  // ─── Dirt speckles: scattered darker/lighter grains below the surface ───
+
+  private static readonly SPECKLE_COUNT = 700;
+  private specklePoints!: THREE.Points;
+
+  private createSpeckles(): THREE.Points {
+    const n = GameRenderer.SPECKLE_COUNT;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+    const colors = new Float32Array(n * 3);
+    const shades = [new THREE.Color("#543318"), new THREE.Color("#7a5230"), new THREE.Color("#2e1c0e")];
+    for (let i = 0; i < n; i++) {
+      const c = shades[Math.floor(GameRenderer.colHash(i * 7 + 3) * shades.length)];
+      colors[i * 3] = c.r;
+      colors[i * 3 + 1] = c.g;
+      colors[i * 3 + 2] = c.b;
+    }
+    geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    const mat = new THREE.PointsMaterial({
+      size: 2.2, vertexColors: true, sizeAttenuation: false, depthWrite: false,
+    });
+    const points = new THREE.Points(geo, mat);
+    points.frustumCulled = false;
+    return points;
+  }
+
+  /** Reposition speckles relative to the CURRENT surface (they sink with craters) */
+  private updateSpeckles(): void {
+    if (!this.specklePoints) return;
+    const terrain = this.engine.terrain;
+    const attr = this.specklePoints.geometry.getAttribute("position") as THREE.BufferAttribute;
+    const arr = attr.array as Float32Array;
+    for (let i = 0; i < GameRenderer.SPECKLE_COUNT; i++) {
+      // Deterministic per-index x + depth so grains stay put between updates
+      const x = GameRenderer.colHash(i * 13 + 1) * WORLD.WIDTH;
+      const depth = 6 + GameRenderer.colHash(i * 29 + 5) ** 2 * 110;
+      arr[i * 3] = x;
+      arr[i * 3 + 1] = terrain.getSurfaceY(x) - depth;
+      arr[i * 3 + 2] = 0.5;
+    }
+    attr.needsUpdate = true;
   }
 
   // ═════════════════════════════════════════════
@@ -326,38 +438,74 @@ export class GameRenderer {
     const group = new THREE.Group();
     group.name = `tank_${playerIndex}`;
     const color = playerIndex === 0 ? 0x3b82f6 : 0xf43f5e;
+    const topColor = playerIndex === 0 ? 0x6aa6f8 : 0xf7758b;
     const darkColor = playerIndex === 0 ? 0x1e4a94 : 0x93293c;
 
-    // Tracks / base
-    const trackGeo = new THREE.BoxGeometry(WORLD.TANK_WIDTH + 4, 6, 12);
-    const trackMat = new THREE.MeshLambertMaterial({ color: darkColor });
+    // Track assembly
+    const trackGeo = new THREE.BoxGeometry(WORLD.TANK_WIDTH + 6, 6.5, 13);
+    const trackMat = new THREE.MeshLambertMaterial({ color: 0x1c212c });
     const tracks = new THREE.Mesh(trackGeo, trackMat);
-    tracks.position.y = 3;
+    tracks.position.y = 3.25;
     group.add(tracks);
 
-    // Body
-    const bodyGeo = new THREE.BoxGeometry(WORLD.TANK_WIDTH, 8, 12);
+    // Road wheels along the track face
+    const wheelGeo = new THREE.CylinderGeometry(2.4, 2.4, 13.6, 12);
+    const wheelMat = new THREE.MeshLambertMaterial({ color: 0x0e1118 });
+    for (const wx of [-9, -3, 3, 9]) {
+      const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+      wheel.rotation.x = Math.PI / 2;
+      wheel.position.set(wx, 3.1, 0);
+      group.add(wheel);
+    }
+
+    // Mudguard lip over the tracks
+    const guardGeo = new THREE.BoxGeometry(WORLD.TANK_WIDTH + 7, 1.4, 13.5);
+    const guardMat = new THREE.MeshLambertMaterial({ color: darkColor });
+    const guard = new THREE.Mesh(guardGeo, guardMat);
+    guard.position.y = 6.9;
+    group.add(guard);
+
+    // Hull
+    const bodyGeo = new THREE.BoxGeometry(WORLD.TANK_WIDTH, 6, 12);
     const bodyMat = new THREE.MeshLambertMaterial({ color });
     const body = new THREE.Mesh(bodyGeo, bodyMat);
     body.name = "body";
-    body.position.y = 10;
+    body.position.y = 10.4;
     group.add(body);
 
-    // Turret dome
-    const domeGeo = new THREE.SphereGeometry(6.5, 14, 10);
+    // Upper glacis — narrower, lighter two-tone accent
+    const glacisGeo = new THREE.BoxGeometry(WORLD.TANK_WIDTH * 0.66, 3.2, 10);
+    const glacisMat = new THREE.MeshLambertMaterial({ color: topColor });
+    const glacis = new THREE.Mesh(glacisGeo, glacisMat);
+    glacis.position.y = 14.6;
+    group.add(glacis);
+
+    // Turret dome + hatch
+    const domeGeo = new THREE.SphereGeometry(6.2, 16, 12);
     const domeMat = new THREE.MeshLambertMaterial({ color });
     const dome = new THREE.Mesh(domeGeo, domeMat);
-    dome.scale.y = 0.75;
-    dome.position.y = TURRET_PIVOT_Y - 1;
+    dome.scale.y = 0.72;
+    dome.position.y = TURRET_PIVOT_Y - 0.5;
     group.add(dome);
 
-    // Barrel — child of group, positioned+rotated around the turret pivot
-    const barrelGeo = new THREE.BoxGeometry(WORLD.TURRET_LENGTH, 3.2, 4);
+    const hatchGeo = new THREE.CylinderGeometry(2, 2.3, 1.4, 10);
+    const hatch = new THREE.Mesh(hatchGeo, new THREE.MeshLambertMaterial({ color: topColor }));
+    hatch.position.set(-1.5, TURRET_PIVOT_Y + 3.6, 0);
+    group.add(hatch);
+
+    // Barrel — child of group, positioned+rotated around the turret pivot.
+    // Muzzle brake is a child of the barrel so it inherits the rotation.
+    const barrelGeo = new THREE.BoxGeometry(WORLD.TURRET_LENGTH, 3, 4);
     const barrelMat = new THREE.MeshLambertMaterial({ color: 0x59616e });
     const barrel = new THREE.Mesh(barrelGeo, barrelMat);
     barrel.name = "barrel";
     barrel.position.set(WORLD.TURRET_LENGTH / 2, TURRET_PIVOT_Y, -0.5);
     group.add(barrel);
+
+    const muzzleGeo = new THREE.BoxGeometry(3, 4.4, 4.6);
+    const muzzle = new THREE.Mesh(muzzleGeo, new THREE.MeshLambertMaterial({ color: 0x39404c }));
+    muzzle.position.set(WORLD.TURRET_LENGTH / 2 - 1.5, 0, 0);
+    barrel.add(muzzle);
 
     // Active player halo — flat ring facing the camera (XY plane)
     const ringGeo = new THREE.RingGeometry(WORLD.TANK_WIDTH * 0.95, WORLD.TANK_WIDTH * 1.05, 40);
@@ -870,6 +1018,12 @@ export class GameRenderer {
 
     this.terrainGeo.dispose();
     (this.terrainMesh.material as THREE.Material).dispose();
+
+    this.surfaceLine.geometry.dispose();
+    (this.surfaceLine.material as THREE.Material).dispose();
+
+    this.specklePoints.geometry.dispose();
+    (this.specklePoints.material as THREE.Material).dispose();
 
     this.skyMesh.geometry.dispose();
     (this.skyMesh.material as THREE.Material).dispose();

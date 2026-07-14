@@ -138,6 +138,32 @@ describe("new powers", () => {
   });
 });
 
+describe("360° turret rotation", () => {
+  it("wraps angles instead of clamping to the upper semicircle", () => {
+    const engine = new GameEngine(2);
+    engine.initGame(TEN("single_shot"), TEN("single_shot"));
+    engine.setAngle(-30);
+    expect(engine.getTanks()[0].angleDeg).toBe(330);
+    engine.setAngle(400);
+    expect(engine.getTanks()[0].angleDeg).toBe(40);
+    engine.setAngle(200); // beyond the old 180° clamp — backwards/down allowed
+    expect(engine.getTanks()[0].angleDeg).toBe(200);
+  });
+
+  it("firing backwards works (P1 shoots left past vertical)", () => {
+    const engine = new GameEngine(6);
+    engine.initGame(TEN("cannonball"), TEN("single_shot"));
+    const startX = engine.getTanks()[0].x;
+    engine.setAngle(160); // up-and-behind for P1
+    engine.setPower(40);
+    engine.fire();
+    engine.advance(12);
+    expect(engine.getSnapshot().phase).not.toBe("FIRING");
+    // The shot carved terrain BEHIND the shooter (left of spawn)
+    expect(engine.getTanks()[0].x).toBe(startX); // shooter unmoved
+  });
+});
+
 describe("scoring attribution (§2.4 — points go to the shooter)", () => {
   it("hitting yourself costs YOU points; the enemy earns nothing", () => {
     const engine = new GameEngine(3);
