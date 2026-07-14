@@ -8,7 +8,7 @@
 //  (the seeded-PRNG rule applies to the engine only).
 // ═══════════════════════════════════════════════════════════
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getEngine } from "../../game/GameStore";
 import { getWeapon, DRAFT_POOL, PREMIUM_POOL } from "../../game/engine/weapons";
 import { WeaponIcon, PlayIcon, TankLogo } from "./icons";
@@ -51,17 +51,59 @@ function hiddenWeapons(owned: readonly string[]): string[] {
   return pool.slice(0, HIDDEN_WEAPONS);
 }
 
-export function DraftModal() {
-  const [round, setRound] = useState(1);
-  const [pickInRound, setPickInRound] = useState(0); // 0 = first picker, 1 = second
-  const [picks, setPicks] = useState<[string[], string[]]>([[], []]);
-  const [deal, setDeal] = useState<string[]>(() => dealCards(new Set()));
+/**
+ * Single source of truth for the draft's progress.
+ *
+ * All of round/pickInRound/picks/deal live in ONE object so they advance
+ * atomically via a functional `setState` updater — no handler ever reads a
+ * stale `round`/`pickInRound`/`picks`/`deal` from the render closure, which
+ * is what caused the double-pick (6/5) and stuck-screen bugs under rapid
+ * double-clicks.
+ */
+interface DraftState {
+  /** 1..TOTAL_ROUNDS */
+  round: number;
+  /** 0 = first picker of the round, 1 = second */
+  pickInRound: 0 | 1;
+  /** [player1Picks, player2Picks] */
+  picks: [string[], string[]];
+  /** The 6 dealt cards for the current round */
+  deal: string[];
+  /** Re-entry lock: set true the instant a pick is accepted; cleared on the
+   *  next commit so the second picker (or next round) can act. The cards
+   *  derive their `disabled` prop from this for immediate visual feedback,
+   *  and onPick also early-returns on a stale click for absolute safety. */
+  locked: boolean;
+}
 
-  const firstPicker: 0 | 1 = round % 2 === 1 ? 0 : 1; // P1 first in odd rounds (§2.5)
-  const currentPicker: 0 | 1 = pickInRound === 0 ? firstPicker : (firstPicker === 0 ? 1 : 0);
+/** Whose turn it is for a given state. P1 first in odd rounds (§2.5). */
+function pickPickerFor(s: DraftState): 0 | 1 {
+  const firstPicker: 0 | 1 = s.round % 2 === 1 ? 0 : 1;
+  return s.pickInRound === 0 ? firstPicker : firstPicker === 0 ? 1 : 0;
+}
+
+function initialDraftState(): DraftState {
+  return {
+    round: 1,
+    pickInRound: 0,
+    picks: [[], []],
+    deal: dealCards(new Set()),
+    locked: false,
+  };
+}
+
+export function DraftModal() {
+  const [state, setState] = useState<DraftState>(initialDraftState);
+
+  // Guarantees finishDraft / initGame runs at most once.
+  const finishedRef = useRef(false);
+
+  const currentPicker = pickPickerFor(state);
   const pickerColor = P_COLORS[currentPicker];
 
   const finishDraft = (finalPicks: [string[], string[]]) => {
+    if (finishedRef.current) return;
+    finishedRef.current = true;
     const engine = getEngine();
     const p1 = [...finalPicks[0], ...hiddenWeapons(finalPicks[0])];
     const p2 = [...finalPicks[1], ...hiddenWeapons(finalPicks[1])];
@@ -69,31 +111,71 @@ export function DraftModal() {
   };
 
   const onPick = (weaponId: string) => {
-    const next: [string[], string[]] = [
-      currentPicker === 0 ? [...picks[0], weaponId] : picks[0],
-      currentPicker === 1 ? [...picks[1], weaponId] : picks[1],
-    ];
-    setPicks(next);
+    // Re-entry guard: a click while a prior pick is still committing is a
+    // no-op. This blocks the exact rapid-double-click race that caused 6/5.
+    if (finishedRef.current) return;
 
-    if (pickInRound === 0) {
-      // Second player picks from the remaining 5 cards
-      setDeal(deal.filter((id) => id !== weaponId));
-      setPickInRound(1);
-      return;
-    }
+    // Functional updater: never reads stale draft state from the closure.
+    setState((prev) => {
+      // ── Hard invariants: reject any pick that would break the draft ──
+      // 1. A pick is already in flight (waiting for this commit).
+      if (prev.locked) return prev;
+      // 2. Card not dealt this round (already picked / stale click).
+      if (!prev.deal.includes(weaponId)) return prev;
+      // 3. The picker may never exceed TOTAL_ROUNDS picks.
+      const picker = pickPickerFor(prev);
+      if (prev.picks[picker].length >= TOTAL_ROUNDS) return prev;
 
-    // Round complete
-    if (round === TOTAL_ROUNDS) {
-      finishDraft(next);
-      return;
-    }
-    const taken = new Set([...next[0], ...next[1]]);
-    setRound(round + 1);
-    setPickInRound(0);
-    setDeal(dealCards(taken));
+      const nextPicks: [string[], string[]] = [
+        picker === 0 ? [...prev.picks[0], weaponId] : prev.picks[0],
+        picker === 1 ? [...prev.picks[1], weaponId] : prev.picks[1],
+      ];
+
+      if (prev.pickInRound === 0) {
+        // Second player picks from the remaining 5 cards. Stays locked one
+        // frame, then the next commit (pickInRound === 1) clears it below.
+        return {
+          ...prev,
+          picks: nextPicks,
+          deal: prev.deal.filter((id) => id !== weaponId),
+          pickInRound: 1,
+          locked: true,
+        };
+      }
+
+      // Round complete
+      if (prev.round === TOTAL_ROUNDS) {
+        // Schedule the handoff AFTER the state commit so the modal can
+        // unmount cleanly. Exactly-once is enforced by finishedRef.
+        queueMicrotask(() => finishDraft(nextPicks));
+        return { ...prev, picks: nextPicks, locked: true };
+      }
+
+      const taken = new Set([...nextPicks[0], ...nextPicks[1]]);
+      return {
+        ...prev,
+        picks: nextPicks,
+        round: prev.round + 1,
+        pickInRound: 0,
+        deal: dealCards(taken),
+        locked: true,
+      };
+    });
   };
 
+  // After every commit that left the draft locked (a pick just landed),
+  // unlock so the next picker can act. Runs once per commit, after paint
+  // is committed, so the locked state was already reflected in the DOM —
+  // exactly one frame of disabled cards (instant to the user). If the
+  // draft just finished, the modal unmounts and this never re-fires.
+  useEffect(() => {
+    if (!state.locked || finishedRef.current) return;
+    setState((s) => (s.locked ? { ...s, locked: false } : s));
+  }, [state]);
+
   const skipDraft = () => {
+    if (finishedRef.current) return;
+    finishedRef.current = true;
     getEngine().quickStart();
   };
 
@@ -129,7 +211,7 @@ export function DraftModal() {
             PLAYER {currentPicker + 1} PICKS
           </h2>
           <p className="text-xs text-white/35 mt-1">
-            {pickInRound === 0 ? "First pick of the round" : "Second pick — 5 cards left"}
+            {state.pickInRound === 0 ? "First pick of the round" : "Second pick — 5 cards left"}
             {" · "}each player also receives {HIDDEN_WEAPONS} mystery weapons
           </p>
           {/* Round progress dots */}
@@ -137,30 +219,31 @@ export function DraftModal() {
             {Array.from({ length: TOTAL_ROUNDS }).map((_, i) => (
               <span key={i} className="rounded-full transition-all"
                 style={{
-                  width: i + 1 === round ? 22 : 8,
+                  width: i + 1 === state.round ? 22 : 8,
                   height: 8,
-                  background: i + 1 < round
+                  background: i + 1 < state.round
                     ? "rgba(255,255,255,0.55)"
-                    : i + 1 === round
+                    : i + 1 === state.round
                       ? pickerColor
                       : "rgba(255,255,255,0.14)",
                 }} />
             ))}
-            <span className="text-[10px] text-white/35 ml-1 tabular-nums">ROUND {round}/{TOTAL_ROUNDS}</span>
+            <span className="text-[10px] text-white/35 ml-1 tabular-nums">ROUND {state.round}/{TOTAL_ROUNDS}</span>
           </div>
         </div>
 
         {/* Cards */}
         <div className="grid grid-cols-2 md:grid-cols-3 gap-3 w-full">
-          {deal.map((id) => {
+          {state.deal.map((id) => {
             const w = getWeapon(id);
             if (!w) return null;
             return (
               <button
                 key={id}
                 data-draft-card
+                disabled={state.locked}
                 onClick={() => onPick(id)}
-                className="group text-left rounded-2xl p-4 min-h-[104px] transition-all hover:scale-[1.03] hover:bg-white/10 active:scale-95"
+                className="group text-left rounded-2xl p-4 min-h-[104px] transition-all hover:scale-[1.03] hover:bg-white/10 active:scale-95 disabled:opacity-40 disabled:hover:scale-100 disabled:pointer-events-none"
                 style={{
                   background: "rgba(255,255,255,0.045)",
                   border: `1px solid ${w.premium ? "rgba(251,191,36,0.35)" : "rgba(255,255,255,0.1)"}`,
@@ -196,10 +279,10 @@ export function DraftModal() {
           {[0, 1].map((p) => (
             <div key={p} className="flex-1">
               <p className="text-[10px] tracking-widest font-semibold mb-1.5" style={{ color: P_COLORS[p] }}>
-                PLAYER {p + 1} — {picks[p].length}/{TOTAL_ROUNDS} PICKS
+                PLAYER {p + 1} — {state.picks[p].length}/{TOTAL_ROUNDS} PICKS
               </p>
               <div className={`flex flex-wrap gap-1.5 ${p === 1 ? "justify-start" : ""}`}>
-                {picks[p].map((id, i) => {
+                {state.picks[p].map((id, i) => {
                   const w = getWeapon(id);
                   if (!w) return null;
                   return (
@@ -211,7 +294,7 @@ export function DraftModal() {
                     </span>
                   );
                 })}
-                {picks[p].length === 0 && <span className="text-[10px] text-white/20">no picks yet</span>}
+                {state.picks[p].length === 0 && <span className="text-[10px] text-white/20">no picks yet</span>}
               </div>
             </div>
           ))}
