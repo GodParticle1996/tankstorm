@@ -16,6 +16,52 @@ import { getWeapon } from "../engine/weapons";
 import { sfx } from "../audio/Sfx";
 import type { GameEngine } from "../engine/GameEngine";
 import type { TankState, ProjectileState, VisualEffect, ScorePopup, ZoneEffect } from "../engine/types";
+import type { TerrainTheme } from "../engine/modes";
+
+// ─── Per-mode visual themes ───
+
+interface ThemePalette {
+  skyTop: string; skyMid: string; skyHorizon: string;
+  grassLow: string; grassHigh: string; grassDark: string;
+  dirtLight: string; dirtMid: string; dirtDark: string; deep: string;
+  surfaceLine: string;
+  starOpacity: number;
+  clouds: boolean;
+  cloudColor: string;
+  /** Moon / sun / Earth disc in the sky (null = none) */
+  disc: { color: string; x: number; y: number; r: number; opacity: number } | null;
+}
+
+const THEMES: Record<TerrainTheme, ThemePalette> = {
+  night: {
+    skyTop: "#070b16", skyMid: "#151d38", skyHorizon: "#2b3a63",
+    grassLow: "#55a03f", grassHigh: "#82ce54", grassDark: "#39702c",
+    dirtLight: "#9a6b3d", dirtMid: "#6e4a28", dirtDark: "#3a2614", deep: "#150d06",
+    surfaceLine: "#c8f09a", starOpacity: 0.7, clouds: true, cloudColor: "#9db1d8",
+    disc: { color: "#e8ecf5", x: 860, y: 570, r: 26, opacity: 0.5 },
+  },
+  storm: {
+    skyTop: "#0a0d18", skyMid: "#1c2334", skyHorizon: "#3e4a55",
+    grassLow: "#4d8f42", grassHigh: "#6fb54b", grassDark: "#33612c",
+    dirtLight: "#82613f", dirtMid: "#5c452c", dirtDark: "#332417", deep: "#120d07",
+    surfaceLine: "#a8c98a", starOpacity: 0.2, clouds: true, cloudColor: "#7d92a8",
+    disc: null,
+  },
+  lunar: {
+    skyTop: "#02030a", skyMid: "#05070f", skyHorizon: "#131522",
+    grassLow: "#8f93a2", grassHigh: "#b4b8c6", grassDark: "#6c7080",
+    dirtLight: "#585c6a", dirtMid: "#42454f", dirtDark: "#2a2c33", deep: "#101116",
+    surfaceLine: "#d4d8e6", starOpacity: 1.0, clouds: false, cloudColor: "#ffffff",
+    disc: { color: "#7fa8d9", x: 160, y: 600, r: 36, opacity: 0.85 },
+  },
+  inferno: {
+    skyTop: "#0d0508", skyMid: "#2a0f10", skyHorizon: "#6b2a17",
+    grassLow: "#7a6b3a", grassHigh: "#9c8a48", grassDark: "#57492a",
+    dirtLight: "#7c4a30", dirtMid: "#57301e", dirtDark: "#331a10", deep: "#120705",
+    surfaceLine: "#d9b06a", starOpacity: 0.15, clouds: true, cloudColor: "#b0664a",
+    disc: { color: "#ff5a2a", x: 830, y: 590, r: 30, opacity: 0.45 },
+  },
+};
 
 // Camera base position (battlefield center) — shake jitters around this
 const CAM_X = WORLD.WIDTH / 2;
@@ -89,11 +135,16 @@ export class GameRenderer {
     dirLight.position.set(200, 400, 300);
     this.scene.add(dirLight);
 
-    // ─── Sky & stars ───
+    // ─── Sky, stars, clouds, celestial disc ───
     this.skyMesh = this.createSky();
     this.scene.add(this.skyMesh);
     this.starPoints = this.createStars();
     this.scene.add(this.starPoints);
+    this.createClouds();
+    this.createCelestialDisc();
+
+    // Apply the initial theme BEFORE the terrain is built (it reads palette)
+    this.applyThemeIfChanged();
 
     // ─── Terrain mesh (§2.2 — built once, position buffer rewritten on change) ───
     // Surface line + speckles are created first so the initial
@@ -149,6 +200,9 @@ export class GameRenderer {
     const particlePoints = new THREE.Points(this.particleGeo, this.particleMaterial);
     particlePoints.frustumCulled = false;
     this.scene.add(particlePoints);
+
+    // Smoke & debris pool (normal blending — dark particles)
+    this.initSmokePool();
 
     // ─── Score popup group ───
     this.popupGroup = new THREE.Group();
@@ -240,6 +294,111 @@ export class GameRenderer {
   }
 
   // ═════════════════════════════════════════════
+  //  Theme (per battle mode): sky, palette, clouds, moon/sun
+  // ═════════════════════════════════════════════
+
+  private activeThemeId: TerrainTheme | null = null;
+  private theme: ThemePalette = THEMES.night;
+
+  private applyThemeIfChanged(): void {
+    const id = this.engine.getMode().theme;
+    if (id === this.activeThemeId) return;
+    this.activeThemeId = id;
+    this.theme = THEMES[id];
+
+    const sky = this.skyMesh.material as THREE.ShaderMaterial;
+    sky.uniforms.topColor.value.set(this.theme.skyTop);
+    sky.uniforms.midColor.value.set(this.theme.skyMid);
+    sky.uniforms.horizonColor.value.set(this.theme.skyHorizon);
+
+    (this.starPoints.material as THREE.PointsMaterial).opacity = this.theme.starOpacity;
+
+    for (const cloud of this.clouds) {
+      cloud.visible = this.theme.clouds;
+      (cloud.material as THREE.SpriteMaterial).color.set(this.theme.cloudColor);
+    }
+
+    const disc = this.theme.disc;
+    this.celestialDisc.visible = this.celestialGlow.visible = disc !== null;
+    if (disc) {
+      this.celestialDisc.position.set(disc.x, disc.y, -220);
+      this.celestialDisc.scale.set(disc.r, disc.r, 1);
+      (this.celestialDisc.material as THREE.MeshBasicMaterial).color.set(disc.color);
+      (this.celestialDisc.material as THREE.MeshBasicMaterial).opacity = disc.opacity;
+      this.celestialGlow.position.set(disc.x, disc.y, -221);
+      this.celestialGlow.scale.set(disc.r * 1.9, disc.r * 1.9, 1);
+      (this.celestialGlow.material as THREE.MeshBasicMaterial).color.set(disc.color);
+      (this.celestialGlow.material as THREE.MeshBasicMaterial).opacity = disc.opacity * 0.22;
+    }
+
+    if (this.surfaceLine) {
+      (this.surfaceLine.material as THREE.LineBasicMaterial).color.set(this.theme.surfaceLine);
+    }
+    if (this.specklePoints) {
+      this.retintSpeckles();
+    }
+    this.engine.terrain.dirty = true; // recolor the terrain bands
+  }
+
+  // ─── Clouds: soft sprites drifting with the wind ───
+
+  private clouds: THREE.Sprite[] = [];
+  private cloudDrift: number[] = [];
+
+  private createClouds(): void {
+    const canvas = document.createElement("canvas");
+    canvas.width = 128;
+    canvas.height = 64;
+    const ctx = canvas.getContext("2d")!;
+    for (const [bx, by, br] of [[40, 38, 26], [70, 30, 30], [98, 40, 22]] as const) {
+      const g = ctx.createRadialGradient(bx, by, 2, bx, by, br);
+      g.addColorStop(0, "rgba(255,255,255,0.55)");
+      g.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 128, 64);
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+
+    for (let i = 0; i < 5; i++) {
+      const mat = new THREE.SpriteMaterial({
+        map: texture, transparent: true, opacity: 0.11 + (i % 3) * 0.025, depthWrite: false,
+      });
+      const cloud = new THREE.Sprite(mat);
+      cloud.scale.set(150 + i * 22, 46 + (i % 3) * 10, 1);
+      cloud.position.set((i / 5) * WORLD.WIDTH + 60, 390 + ((i * 67) % 150), -170);
+      this.clouds.push(cloud);
+      this.cloudDrift.push(4 + (i % 3) * 3);
+      this.scene.add(cloud);
+    }
+  }
+
+  private updateClouds(dt: number, wind: number): void {
+    if (!this.theme.clouds) return;
+    for (let i = 0; i < this.clouds.length; i++) {
+      const cloud = this.clouds[i];
+      cloud.position.x += (this.cloudDrift[i] + wind * 0.55) * dt;
+      if (cloud.position.x > WORLD.WIDTH + 250) cloud.position.x = -250;
+      if (cloud.position.x < -250) cloud.position.x = WORLD.WIDTH + 250;
+    }
+  }
+
+  // ─── Celestial disc (moon / Earth / red sun) ───
+
+  private celestialDisc!: THREE.Mesh;
+  private celestialGlow!: THREE.Mesh;
+
+  private createCelestialDisc(): void {
+    const geo = new THREE.CircleGeometry(1, 40);
+    this.celestialDisc = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+      transparent: true, opacity: 0.5, depthWrite: false,
+    }));
+    this.celestialGlow = new THREE.Mesh(geo.clone(), new THREE.MeshBasicMaterial({
+      transparent: true, opacity: 0.12, depthWrite: false, blending: THREE.AdditiveBlending,
+    }));
+    this.scene.add(this.celestialGlow, this.celestialDisc);
+  }
+
+  // ═════════════════════════════════════════════
   //  Terrain mesh — 6 vertex rows per column:
   //  bright grass / grass shadow / light dirt / mid dirt / dark dirt / deep
   //  skirt, with deterministic per-column color jitter so the ground reads
@@ -309,13 +468,13 @@ export class GameRenderer {
     const positions = posAttr.array as Float32Array;
     const colors = colAttr.array as Float32Array;
 
-    const grassLow = new THREE.Color("#55a03f");
-    const grassHigh = new THREE.Color("#82ce54");
-    const grassDark = new THREE.Color("#39702c");
-    const dirtLight = new THREE.Color("#9a6b3d");
-    const dirtMid = new THREE.Color("#6e4a28");
-    const dirtDark = new THREE.Color("#3a2614");
-    const deep = new THREE.Color("#150d06");
+    const grassLow = new THREE.Color(this.theme.grassLow);
+    const grassHigh = new THREE.Color(this.theme.grassHigh);
+    const grassDark = new THREE.Color(this.theme.grassDark);
+    const dirtLight = new THREE.Color(this.theme.dirtLight);
+    const dirtMid = new THREE.Color(this.theme.dirtMid);
+    const dirtDark = new THREE.Color(this.theme.dirtDark);
+    const deep = new THREE.Color(this.theme.deep);
     const grass = new THREE.Color();
     const jittered = new THREE.Color();
 
@@ -396,21 +555,33 @@ export class GameRenderer {
     const n = GameRenderer.SPECKLE_COUNT;
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(n * 3), 3));
-    const colors = new Float32Array(n * 3);
-    const shades = [new THREE.Color("#543318"), new THREE.Color("#7a5230"), new THREE.Color("#2e1c0e")];
-    for (let i = 0; i < n; i++) {
-      const c = shades[Math.floor(GameRenderer.colHash(i * 7 + 3) * shades.length)];
-      colors[i * 3] = c.r;
-      colors[i * 3 + 1] = c.g;
-      colors[i * 3 + 2] = c.b;
-    }
-    geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(n * 3), 3));
     const mat = new THREE.PointsMaterial({
       size: 2.2, vertexColors: true, sizeAttenuation: false, depthWrite: false,
     });
     const points = new THREE.Points(geo, mat);
     points.frustumCulled = false;
+    this.specklePoints = points;
+    this.retintSpeckles();
     return points;
+  }
+
+  /** Speckle grain colors follow the active theme's dirt shades */
+  private retintSpeckles(): void {
+    const attr = this.specklePoints.geometry.getAttribute("color") as THREE.BufferAttribute;
+    const colors = attr.array as Float32Array;
+    const shades = [
+      new THREE.Color(this.theme.dirtDark),
+      new THREE.Color(this.theme.dirtLight),
+      new THREE.Color(this.theme.deep),
+    ];
+    for (let i = 0; i < GameRenderer.SPECKLE_COUNT; i++) {
+      const c = shades[Math.floor(GameRenderer.colHash(i * 7 + 3) * shades.length)];
+      colors[i * 3] = c.r;
+      colors[i * 3 + 1] = c.g;
+      colors[i * 3 + 2] = c.b;
+    }
+    attr.needsUpdate = true;
   }
 
   /** Reposition speckles relative to the CURRENT surface (they sink with craters) */
@@ -531,16 +702,43 @@ export class GameRenderer {
     return group;
   }
 
-  private updateTankModel(group: THREE.Group, tank: TankState, isActive: boolean, timeSec: number): void {
-    group.position.set(tank.x, tank.y, 0);
+  /** Per-tank smoothed display state (position lerp + hull tilt) */
+  private tankView = [
+    { x: Number.NaN, y: 0, tilt: 0 },
+    { x: Number.NaN, y: 0, tilt: 0 },
+  ];
 
-    // Rotate barrel around the turret pivot (Y-up: angle 0 = right, 90 = up)
+  private updateTankModel(group: THREE.Group, tank: TankState, isActive: boolean, timeSec: number, dt: number): void {
+    // Smooth movement: hops (Q/E) and knock-arcs glide instead of snapping.
+    // Warp-scale jumps snap directly so the tank doesn't slide across the map.
+    const view = this.tankView[tank.id];
+    if (Number.isNaN(view.x) || Math.abs(tank.x - view.x) > 80) {
+      view.x = tank.x;
+      view.y = tank.y;
+    }
+    const k = 1 - Math.exp(-12 * dt);
+    view.x += (tank.x - view.x) * k;
+    view.y += (tank.y - view.y) * k;
+
+    // Hull tilts to match the ground slope (clamped, eased)
+    const slopeRad = (this.engine.terrain.getSlopeSignedDeg(tank.x) * Math.PI) / 180;
+    const targetTilt = Math.max(-0.45, Math.min(0.45, slopeRad));
+    view.tilt += (targetTilt - view.tilt) * k;
+
+    group.position.set(view.x, view.y, 0);
+    group.rotation.z = view.tilt;
+
+    // Barrel keeps its WORLD aim angle (compensate for hull tilt) and kicks
+    // back along its own axis while recoil decays.
     const angleRad = (tank.angleDeg * Math.PI) / 180;
+    const localAngle = angleRad - view.tilt;
+    const recoilOffset = tank.recoil * tank.recoil * 4.5;
     const barrel = group.getObjectByName("barrel") as THREE.Mesh;
     if (barrel) {
-      barrel.position.x = Math.cos(angleRad) * (WORLD.TURRET_LENGTH / 2);
-      barrel.position.y = TURRET_PIVOT_Y + Math.sin(angleRad) * (WORLD.TURRET_LENGTH / 2);
-      barrel.rotation.z = angleRad;
+      const reach = WORLD.TURRET_LENGTH / 2 - recoilOffset;
+      barrel.position.x = Math.cos(localAngle) * reach;
+      barrel.position.y = TURRET_PIVOT_Y + Math.sin(localAngle) * reach;
+      barrel.rotation.z = localAngle;
     }
 
     // Pulsing halo for the active tank
@@ -585,6 +783,9 @@ export class GameRenderer {
         this.projectileMeshes.set(p.id, mesh);
       }
       mesh.position.set(p.x, p.y, 5);
+      // Streak: stretch the shell along its velocity vector
+      mesh.rotation.z = Math.atan2(p.vy, p.vx);
+      mesh.scale.set(1.7, 0.65, 1);
 
       // Trail: one faint particle per frame at the projectile position
       this.spawnParticles(p.x, p.y, 1, new THREE.Color(weaponColor), 0, 8, 0.2, 0.35, 0);
@@ -637,7 +838,7 @@ export class GameRenderer {
     }
   }
 
-  private updateParticles(dt: number): void {
+  private updateParticles(dt: number, wind = 0): void {
     let writeIdx = 0;
     for (let i = 0; i < this.particleCount; i++) {
       this.particleLife[i] -= dt;
@@ -657,6 +858,8 @@ export class GameRenderer {
         this.particleMaxLife[writeIdx] = this.particleMaxLife[i];
       }
 
+      // Light wind drift on hot particles
+      this.particleVel[writeIdx * 3] += wind * 0.3 * dt;
       this.particlePositions[writeIdx * 3] += this.particleVel[writeIdx * 3] * dt;
       this.particlePositions[writeIdx * 3 + 1] += this.particleVel[writeIdx * 3 + 1] * dt;
 
@@ -680,6 +883,110 @@ export class GameRenderer {
   }
 
   // ═════════════════════════════════════════════
+  //  Smoke & debris pool — NORMAL blending (additive particles can't be
+  //  dark, so smoke plumes and dirt clods live in their own system)
+  // ═════════════════════════════════════════════
+
+  private static readonly SMOKE_POOL = 1200;
+  private smokeGeo!: THREE.BufferGeometry;
+  private smokePositions = new Float32Array(GameRenderer.SMOKE_POOL * 3);
+  private smokeColors = new Float32Array(GameRenderer.SMOKE_POOL * 3);
+  private smokeLife = new Float32Array(GameRenderer.SMOKE_POOL);
+  private smokeMaxLife = new Float32Array(GameRenderer.SMOKE_POOL);
+  private smokeVel = new Float32Array(GameRenderer.SMOKE_POOL * 3);
+  private smokeCount = 0;
+  private smokeMaterial!: THREE.PointsMaterial;
+
+  private initSmokePool(): void {
+    this.smokeGeo = new THREE.BufferGeometry();
+    this.smokeGeo.setAttribute("position", new THREE.BufferAttribute(this.smokePositions, 3));
+    this.smokeGeo.setAttribute("color", new THREE.BufferAttribute(this.smokeColors, 3));
+    this.smokeGeo.setDrawRange(0, 0);
+    this.smokeMaterial = new THREE.PointsMaterial({
+      size: 6,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.85,
+      blending: THREE.NormalBlending,
+      sizeAttenuation: false,
+      depthWrite: false,
+    });
+    const points = new THREE.Points(this.smokeGeo, this.smokeMaterial);
+    points.frustumCulled = false;
+    this.scene.add(points);
+  }
+
+  private spawnSmoke(
+    x: number, y: number, count: number,
+    colorA: THREE.Color, colorB: THREE.Color,
+    speedMin: number, speedMax: number,
+    lifeMin: number, lifeMax: number,
+    gravityScale: number, upwardBias = 0,
+  ): void {
+    for (let i = 0; i < count; i++) {
+      if (this.smokeCount >= GameRenderer.SMOKE_POOL) break;
+      const idx = this.smokeCount++;
+      const angle = Math.random() * Math.PI * 2;
+      const speed = speedMin + Math.random() * (speedMax - speedMin);
+      const life = lifeMin + Math.random() * (lifeMax - lifeMin);
+
+      this.smokePositions[idx * 3] = x + (Math.random() - 0.5) * 6;
+      this.smokePositions[idx * 3 + 1] = y + (Math.random() - 0.5) * 4;
+      this.smokePositions[idx * 3 + 2] = 5.5;
+
+      this.smokeVel[idx * 3] = Math.cos(angle) * speed;
+      this.smokeVel[idx * 3 + 1] = Math.abs(Math.sin(angle)) * speed * 0.6 + upwardBias;
+      this.smokeVel[idx * 3 + 2] = gravityScale;
+
+      const t = Math.random();
+      this.smokeColors[idx * 3] = colorA.r + (colorB.r - colorA.r) * t;
+      this.smokeColors[idx * 3 + 1] = colorA.g + (colorB.g - colorA.g) * t;
+      this.smokeColors[idx * 3 + 2] = colorA.b + (colorB.b - colorA.b) * t;
+
+      this.smokeLife[idx] = life;
+      this.smokeMaxLife[idx] = life;
+    }
+  }
+
+  private updateSmoke(dt: number, wind: number): void {
+    let writeIdx = 0;
+    for (let i = 0; i < this.smokeCount; i++) {
+      this.smokeLife[i] -= dt;
+      if (this.smokeLife[i] <= 0) continue;
+
+      if (i !== writeIdx) {
+        for (let k = 0; k < 3; k++) {
+          this.smokePositions[writeIdx * 3 + k] = this.smokePositions[i * 3 + k];
+          this.smokeVel[writeIdx * 3 + k] = this.smokeVel[i * 3 + k];
+          this.smokeColors[writeIdx * 3 + k] = this.smokeColors[i * 3 + k];
+        }
+        this.smokeLife[writeIdx] = this.smokeLife[i];
+        this.smokeMaxLife[writeIdx] = this.smokeMaxLife[i];
+      }
+
+      // Smoke drifts with the wind much more than hot sparks do
+      this.smokeVel[writeIdx * 3] += wind * 0.9 * dt;
+      this.smokePositions[writeIdx * 3] += this.smokeVel[writeIdx * 3] * dt;
+      this.smokePositions[writeIdx * 3 + 1] += this.smokeVel[writeIdx * 3 + 1] * dt;
+      this.smokeVel[writeIdx * 3 + 1] -= 300 * this.smokeVel[writeIdx * 3 + 2] * dt;
+
+      // Fade toward dark as the puff dies
+      const lifeRatio = Math.max(0, this.smokeLife[writeIdx] / this.smokeMaxLife[writeIdx]);
+      const fade = 0.9 + 0.1 * lifeRatio;
+      this.smokeColors[writeIdx * 3] *= fade;
+      this.smokeColors[writeIdx * 3 + 1] *= fade;
+      this.smokeColors[writeIdx * 3 + 2] *= fade;
+
+      writeIdx++;
+    }
+    this.smokeCount = writeIdx;
+
+    (this.smokeGeo.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
+    (this.smokeGeo.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+    this.smokeGeo.setDrawRange(0, this.smokeCount);
+  }
+
+  // ═════════════════════════════════════════════
   //  Visual effects → particles + transient meshes
   // ═════════════════════════════════════════════
 
@@ -693,15 +1000,27 @@ export class GameRenderer {
       const color = new THREE.Color(eff.color);
       switch (eff.type) {
         case "explosion": {
+          // Hot sparks (additive) + white flash
           const count = Math.min(PARTICLES.MAX_PER_EXPLOSION, Math.floor(eff.radius * 0.8));
           this.spawnParticles(eff.x, eff.y, count, color, 60, 220, 0.35, 0.8, 1);
           this.spawnParticles(eff.x, eff.y, 10, new THREE.Color(0xffffff), 20, 90, 0.1, 0.25, 0.3);
+          // Dirt clods thrown out of the crater (fall with gravity)
+          this.spawnSmoke(eff.x, eff.y, Math.min(18, Math.floor(eff.radius * 0.3)),
+            new THREE.Color(this.theme.dirtLight), new THREE.Color(this.theme.dirtDark),
+            70, 230, 0.6, 1.3, 1.15, 60);
+          // Rising smoke plume
+          this.spawnSmoke(eff.x, eff.y + 4, 12,
+            new THREE.Color(0x585862), new THREE.Color(0x33333c),
+            8, 34, 1.1, 2.2, -0.05, 34);
           this.shakeTrauma = Math.min(1, this.shakeTrauma + eff.radius / 220);
           sfx.boom(eff.radius);
           break;
         }
         case "dust": {
-          this.spawnParticles(eff.x, eff.y, 14, new THREE.Color(0x9a7b52), 30, 90, 0.25, 0.5, 1, 40);
+          // Rolling earth dust (landslides, bounces) — opaque brown puffs
+          this.spawnSmoke(eff.x, eff.y, 10,
+            new THREE.Color(this.theme.dirtLight), new THREE.Color(this.theme.dirtMid),
+            12, 55, 0.5, 1.0, -0.03, 26);
           sfx.thud();
           break;
         }
@@ -923,6 +1242,10 @@ export class GameRenderer {
     const popups = this.engine.getPopups();
     const zones = this.engine.getZones();
     const snapshot = this.engine.getSnapshot();
+    const wind = snapshot.wind;
+
+    // Theme follows the active battle mode (mode is picked in the draft)
+    this.applyThemeIfChanged();
 
     // Update terrain mesh only when terrain was modified (dirty flag — §2.2)
     if (this.engine.terrain.dirty) {
@@ -931,18 +1254,20 @@ export class GameRenderer {
     }
 
     // Update tanks
-    this.updateTankModel(this.tankGroups[0], tanks[0], snapshot.currentPlayer === 0 && snapshot.phase === "AIMING", timeSec);
-    this.updateTankModel(this.tankGroups[1], tanks[1], snapshot.currentPlayer === 1 && snapshot.phase === "AIMING", timeSec);
+    this.updateTankModel(this.tankGroups[0], tanks[0], snapshot.currentPlayer === 0 && snapshot.phase === "AIMING", timeSec, dt);
+    this.updateTankModel(this.tankGroups[1], tanks[1], snapshot.currentPlayer === 1 && snapshot.phase === "AIMING", timeSec, dt);
 
     // Update projectiles (+trails)
     this.updateProjectiles(projectiles);
 
-    // Effects
+    // Effects (smoke/dust drift with the wind)
     this.processVisualEffects(effects);
     this.updateBeams(effects);
     this.updateExplosionRings(effects);
     this.updateZoneParticles(zones, dt);
-    this.updateParticles(dt);
+    this.updateParticles(dt, wind);
+    this.updateSmoke(dt, wind);
+    this.updateClouds(dt, wind);
 
     // Aim preview + popups
     this.updateTrajectory();
@@ -1033,6 +1358,20 @@ export class GameRenderer {
 
     this.particleGeo.dispose();
     this.particleMaterial.dispose();
+
+    this.smokeGeo.dispose();
+    this.smokeMaterial.dispose();
+
+    for (const cloud of this.clouds) {
+      (cloud.material as THREE.SpriteMaterial).map?.dispose();
+      (cloud.material as THREE.SpriteMaterial).dispose();
+    }
+    this.clouds = [];
+
+    this.celestialDisc.geometry.dispose();
+    (this.celestialDisc.material as THREE.Material).dispose();
+    this.celestialGlow.geometry.dispose();
+    (this.celestialGlow.material as THREE.Material).dispose();
 
     (this.trajectoryLine.geometry as THREE.BufferGeometry).dispose();
     (this.trajectoryLine.material as THREE.Material).dispose();

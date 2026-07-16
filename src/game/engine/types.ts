@@ -27,9 +27,13 @@ export interface TankState {
   selectedWeapon: string;
   // Shield status (checked in single applyHitToTank chokepoint)
   shieldHp: number; // > 0 means shielded; absorbs damage
-  // Falling state for tank settling
+  // Falling state for tank settling (knockback is impulse-based:
+  // explosions throw tanks in arcs instead of teleporting them)
+  vx: number; // horizontal velocity while airborne
   vy: number; // vertical velocity while falling (0 when grounded)
   falling: boolean;
+  // Visual barrel recoil, 1 → 0 after firing (renderer reads it)
+  recoil: number;
 }
 
 // ─── Projectile ───
@@ -159,6 +163,7 @@ export interface GameSnapshot {
   phase: GamePhase;
   round: number;
   maxRounds: number;
+  modeName: string; // active battle mode display name
   currentPlayer: 0 | 1;
   wind: number;
   // Per-player readouts (change on discrete events, not per-frame)

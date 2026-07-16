@@ -10,7 +10,8 @@ import { Rng } from "./prng";
 import { Terrain } from "./Terrain";
 import { Physics } from "./Physics";
 import { Collision } from "./Collision";
-import { getWeapon, DRAFT_POOL } from "./weapons";
+import { getWeapon, DRAFT_POOL, PREMIUM_POOL } from "./weapons";
+import { DEFAULT_MODE, getMode, type ModeConfig } from "./modes";
 import type {
   GamePhase, TankState, ProjectileState, ZoneEffect,
   VisualEffect, ScorePopup, GameSnapshot, AimReadout,
@@ -50,6 +51,8 @@ export class GameEngine {
   readonly terrain: Terrain;
   private rng: Rng;
   private state: EngineState;
+  /** Active battle mode (world rules + theme). Set before initGame. */
+  private mode: ModeConfig = DEFAULT_MODE;
 
   // Fixed timestep accumulator
   private accumulator = 0;
@@ -118,14 +121,36 @@ export class GameEngine {
   /** Get snapshot version (for change detection) */
   getSnapshotVersion = (): number => snapshotVersion;
 
+  /** Select the battle mode (world rules + theme). Call before initGame. */
+  setMode(modeId: string): void {
+    this.mode = getMode(modeId);
+  }
+
+  getMode(): ModeConfig {
+    return this.mode;
+  }
+
   /** Initialize / reset the game with weapon arrays from draft */
   initGame(p1Weapons: string[], p2Weapons: string[]): void {
     this.terrain.generate(this.rng);
+
+    // Mode flavor: pre-cratered battlefield (Lunar War). Craters are carved
+    // mid-map (away from the flattened spawn zones) and relaxed to rest so
+    // the match starts on settled ground.
+    for (let c = 0; c < this.mode.precarveCraters; c++) {
+      const cx = this.rng.range(WORLD.WIDTH * 0.28, WORLD.WIDTH * 0.72);
+      const r = this.rng.range(25, 55);
+      this.terrain.carveCrater(cx, this.terrain.getSurfaceY(cx) + r * 0.4, r);
+    }
+    while (this.terrain.relaxStep(PHYSICS.FIXED_DT)) { /* settle pre-craters */ }
+
     this.state = this.createInitialState();
     this.state.tanks[0].weapons = [...p1Weapons];
     this.state.tanks[0].selectedWeapon = p1Weapons[0] ?? "";
     this.state.tanks[1].weapons = [...p2Weapons];
     this.state.tanks[1].selectedWeapon = p2Weapons[0] ?? "";
+    this.state.tanks[0].movesRemaining = this.mode.moves;
+    this.state.tanks[1].movesRemaining = this.mode.moves;
     // Settle tanks on terrain surface
     this.state.tanks[0].y = this.terrain.getSurfaceYAvg(this.state.tanks[0].x, WORLD.TANK_WIDTH / 2);
     this.state.tanks[1].y = this.terrain.getSurfaceYAvg(this.state.tanks[1].x, WORLD.TANK_WIDTH / 2);
@@ -135,12 +160,16 @@ export class GameEngine {
     this.notifyChange();
   }
 
-  /** Quick start without draft — each player gets Single Shot + 9 random distinct weapons */
+  /** Quick start without draft — each player gets Single Shot + 9 random distinct weapons.
+   *  Heavy Metal mode deals exclusively from the premium pool. */
   quickStart(): void {
+    const basePool = this.mode.premiumOnly ? PREMIUM_POOL : DRAFT_POOL;
     const randomArsenal = (): string[] => {
-      const pool = DRAFT_POOL.filter((id) => id !== "single_shot");
+      const pool = basePool.filter((id) => id !== "single_shot");
       this.rng.shuffle(pool);
-      return ["single_shot", ...pool.slice(0, 9)];
+      return this.mode.premiumOnly
+        ? pool.slice(0, 10)
+        : ["single_shot", ...pool.slice(0, 9)];
     };
     this.initGame(randomArsenal(), randomArsenal());
   }
@@ -211,9 +240,10 @@ export class GameEngine {
     if (weaponIdx >= 0) tank.weapons.splice(weaponIdx, 1);
     tank.selectedWeapon = tank.weapons[0] ?? "";
 
-    // Muzzle flash at the turret tip
+    // Muzzle flash at the turret tip + barrel recoil kick
     const muzzle = Physics.getTurretTip(tank);
     this.spawnVisualEffect("spark", muzzle.x, muzzle.y, 10, weapon.color, 0.25);
+    tank.recoil = 1;
 
     // Increment fired count for this player
     if (tank.id === 0) this.state.p1FiredCount++;
@@ -336,6 +366,11 @@ export class GameEngine {
     this.updateVisualEffects(dt);
     this.updatePopups(dt);
 
+    // Barrel recoil eases back in every phase
+    for (const tank of this.state.tanks) {
+      tank.recoil = Math.max(0, tank.recoil - dt * 2.5);
+    }
+
     if (this.state.phase === "ROUND_END") {
       this.state.quietTimer += dt;
       if (this.state.quietTimer >= 2.0) {
@@ -354,14 +389,30 @@ export class GameEngine {
     // Update projectiles
     this.updateProjectiles(dt);
 
+    // Landslides: loose dirt slides toward the angle of repose, animated
+    // over real frames. The turn waits for the ground to stop moving.
+    if (this.terrain.relaxing) {
+      this.terrain.relaxStep(dt);
+      this.state.quietTimer = 0;
+      // Rolling dust puffs along the slide (rate-limited, deterministic)
+      if (Math.floor(this.engineTime / 0.09) !== Math.floor((this.engineTime - dt) / 0.09)) {
+        const dustX = this.terrain.lastSlideX;
+        this.spawnVisualEffect("dust", dustX, this.terrain.getSurfaceY(dustX) + 3, 8, "#8a6a44", 0.4);
+      }
+    }
+
     // Settle tanks (gravity fall after terrain modification — §1.7)
     this.settleTanks(dt);
 
     // Check settlement (§1.6)
     this.checkSettlement(dt);
 
-    // Watchdog (§1.6)
-    if (this.engineTime - this.state.firingStartTime > PHYSICS.WATCHDOG_MAX_SECONDS) {
+    // Watchdog (§1.6) — only while there is actually something to detonate,
+    // otherwise a post-watchdog landslide would re-trigger it every step
+    if (
+      this.engineTime - this.state.firingStartTime > PHYSICS.WATCHDOG_MAX_SECONDS &&
+      (this.state.projectiles.length > 0 || this.salvoQueue.length > 0)
+    ) {
       this.forceDetonateAll();
     }
   }
@@ -383,9 +434,9 @@ export class GameEngine {
         Physics.applyHoming(p, target.x, target.y + WORLD.TANK_HEIGHT / 2, dt);
       }
 
-      // Physics step (semi-implicit Euler — §1.2)
+      // Physics step (semi-implicit Euler — §1.2; gravity scaled by mode)
       const wind = weapon.projectile.windImmune ? 0 : this.state.wind;
-      Physics.stepProjectile(p, wind, dt);
+      Physics.stepProjectile(p, wind, dt, PHYSICS.GRAVITY * this.mode.gravityScale);
 
       // Dev-mode NaN assertion (§Part 4 item 10)
       if (import.meta.env?.DEV) {
@@ -475,15 +526,15 @@ export class GameEngine {
   private executeImpactSpec(spec: ImpactSpec, p: ProjectileState, x: number, y: number): void {
     switch (spec.kind) {
       case "explosion": {
-        // Carve crater
-        this.terrain.carveCrater(x, y, spec.radius * spec.craterScale);
+        // Carve crater (scaled by battle mode)
+        this.terrain.carveCrater(x, y, spec.radius * spec.craterScale * this.mode.craterMult);
         // Visual effect
         this.spawnVisualEffect("explosion", x, y, spec.radius, getWeapon(p.weaponId)?.color ?? "#ff6b35", 0.8);
         // Score via single chokepoint
         this.applyExplosionScore(p, x, y, spec.radius, getWeapon(p.weaponId)?.basePoints ?? 0);
         // Knockback
         if (spec.knockback > 0) {
-          this.applyKnockback(p, x, y, spec.knockback);
+          this.applyKnockback(p, x, y, spec.knockback * this.mode.knockbackMult);
         }
         break;
       }
@@ -695,7 +746,7 @@ export class GameEngine {
 
     if (multiplier === 0) return;
 
-    let score = basePoints * multiplier;
+    let score = basePoints * multiplier * this.mode.pointsMult;
 
     // Shield absorption (the victim's shield eats the points)
     if (tank.shieldHp > 0) {
@@ -763,6 +814,8 @@ export class GameEngine {
   //  Knockback
   // ═════════════════════════════════════════════
 
+  /** Impulse-based: explosions THROW tanks in an arc (velocity change),
+   *  they don't teleport. settleTanks integrates the flight. */
   private applyKnockback(p: ProjectileState, x: number, y: number, strength: number): void {
     for (let t = 0; t < 2; t++) {
       const tank = this.state.tanks[t];
@@ -771,11 +824,9 @@ export class GameEngine {
       const dist = Math.sqrt(dx * dx + dy * dy);
       if (dist < 80) {
         const force = (1 - dist / 80) * strength;
-        if (dist > 1) {
-          tank.x += (dx / dist) * force;
-          tank.x = Math.max(15, Math.min(WORLD.WIDTH - 15, tank.x));
-        }
-        tank.y += force * 0.5;
+        const dirX = dist > 1 ? dx / dist : 0;
+        tank.vx += dirX * force * 3.2;
+        tank.vy += force * 2.6 + Math.abs(force) * 0.4;
         tank.falling = true;
       }
     }
@@ -827,6 +878,7 @@ export class GameEngine {
     // Visual beam effect (radius carries the beam width for the renderer)
     const beamWidth = weapon.impact[0]?.kind === "beam" ? (weapon.impact[0] as { width: number }).width : 3;
     this.spawnVisualEffectBeam(tip.x, tip.y, endX, endY, beamWidth * 2, weapon.color, 0.4);
+    tank.recoil = 1;
 
     // Enter FIRING phase briefly for settlement (beam resolves instantly)
     this.state.phase = "FIRING";
@@ -874,7 +926,14 @@ export class GameEngine {
     for (let t = 0; t < 2; t++) {
       const tank = this.state.tanks[t];
       if (!tank.falling && this.terrain.isGrounded(tank.x, tank.y, WORLD.TANK_WIDTH / 2)) {
+        tank.vx = 0;
         continue;
+      }
+      // Horizontal flight while airborne (knockback arcs) with air drag
+      if (tank.falling && tank.vx !== 0) {
+        tank.x = Math.max(15, Math.min(WORLD.WIDTH - 15, tank.x + tank.vx * dt));
+        tank.vx *= Math.max(0, 1 - 1.2 * dt);
+        if (Math.abs(tank.vx) < 1) tank.vx = 0;
       }
       const result = this.terrain.settleTankStep(
         tank.x, tank.y, tank.vy, WORLD.TANK_WIDTH / 2, dt,
@@ -882,6 +941,7 @@ export class GameEngine {
       tank.y = result.y;
       tank.vy = result.vy;
       tank.falling = result.falling;
+      if (!tank.falling) tank.vx = 0; // landed — friction kills the slide
       if (tank.falling) this.state.quietTimer = 0;
     }
   }
@@ -893,11 +953,12 @@ export class GameEngine {
   private checkSettlement(dt: number): void {
     if (this.state.phase !== "FIRING") return;
 
-    // Check if world is quiet
+    // Check if world is quiet — active landslides block settlement
     const noProjectiles = this.state.projectiles.length === 0 && this.salvoQueue.length === 0;
     const noFalling = !this.state.tanks[0].falling && !this.state.tanks[1].falling;
+    const groundStill = !this.terrain.relaxing;
     // Zone effects (fire, radiation) do NOT block settlement (§1.6)
-    const isQuiet = noProjectiles && noFalling;
+    const isQuiet = noProjectiles && noFalling && groundStill;
 
     if (isQuiet) {
       this.state.quietTimer += dt;
@@ -926,7 +987,7 @@ export class GameEngine {
     const p1Fired = this.state.p1FiredCount;
     const p2Fired = this.state.p2FiredCount;
     // Game over only when BOTH players have fired all their volleys
-    if (p1Fired >= WORLD.MAX_VOLLEYS && p2Fired >= WORLD.MAX_VOLLEYS) {
+    if (p1Fired >= this.mode.volleys && p2Fired >= this.mode.volleys) {
       this.state.phase = "GAME_OVER";
       this.state.winner = this.determineWinner();
       this.notifyChange();
@@ -1199,7 +1260,8 @@ export class GameEngine {
     // and clip it at the terrain so it never draws through mountains.
     const raw = Physics.predictTrajectory(
       tip.x, tip.y, tank.angleDeg, tank.power,
-      this.state.wind, massScale, 26,
+      this.state.wind, massScale, 26, 1 / 60,
+      PHYSICS.GRAVITY * this.mode.gravityScale,
     );
     const trajectory: { x: number; y: number }[] = [];
     for (const pt of raw) {
@@ -1218,10 +1280,11 @@ export class GameEngine {
   // ═════════════════════════════════════════════
 
   private generateWind(): number {
+    if (this.mode.windRange === 0) return 0; // airless (Lunar War)
     // Curved distribution — extreme winds less common
     const raw = this.rng.range(-1, 1);
     const curved = Math.sign(raw) * Math.pow(Math.abs(raw), 1.5);
-    return Math.round(curved * PHYSICS.WIND_RANGE);
+    return Math.round(curved * this.mode.windRange);
   }
 
   private determineWinner(): 0 | 1 | -1 {
@@ -1249,13 +1312,13 @@ export class GameEngine {
           id: 0, x: p1X, y: 200, angleDeg: 45, power: 50,
           score: 0, movesRemaining: WORLD.MAX_MOVES,
           weapons: [], selectedWeapon: "",
-          shieldHp: 0, vy: 0, falling: false,
+          shieldHp: 0, vx: 0, vy: 0, falling: false, recoil: 0,
         },
         {
           id: 1, x: p2X, y: 200, angleDeg: 135, power: 50,
           score: 0, movesRemaining: WORLD.MAX_MOVES,
           weapons: [], selectedWeapon: "",
-          shieldHp: 0, vy: 0, falling: false,
+          shieldHp: 0, vx: 0, vy: 0, falling: false, recoil: 0,
         },
       ],
       projectiles: [],
@@ -1280,7 +1343,8 @@ export class GameEngine {
     return {
       phase: this.state.phase,
       round: this.state.round,
-      maxRounds: WORLD.MAX_VOLLEYS,
+      maxRounds: this.mode.volleys,
+      modeName: this.mode.name,
       currentPlayer: this.state.currentPlayer,
       wind: this.state.wind,
       p1Score: Math.round(p1.score),

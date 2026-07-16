@@ -3,6 +3,7 @@
 import { describe, it, expect } from "vitest";
 import { GameEngine } from "../GameEngine";
 import { WORLD } from "../constants";
+import { PREMIUM_POOL } from "../weapons";
 
 const TEN = (id: string): string[] => Array(10).fill(id);
 
@@ -135,6 +136,49 @@ describe("new powers", () => {
     expect(tank.x).toBeLessThanOrEqual(WORLD.WIDTH - 25);
     // Settled back onto the surface
     expect(Math.abs(tank.y - engine.terrain.getSurfaceYAvg(tank.x, WORLD.TANK_WIDTH / 2))).toBeLessThan(2);
+  });
+});
+
+describe("battle modes", () => {
+  it("Storm Blitz: 5 volleys, 2 moves, its own name in the snapshot", () => {
+    const engine = new GameEngine(9);
+    engine.setMode("blitz");
+    engine.initGame(TEN("single_shot"), TEN("single_shot"));
+    const snap = engine.getSnapshot();
+    expect(snap.maxRounds).toBe(5);
+    expect(snap.p1Moves).toBe(2);
+    expect(snap.modeName).toBe("Storm Blitz");
+  });
+
+  it("Lunar War: zero wind and low gravity carries the same shot much farther", () => {
+    const maxFlightX = (modeId: string): number => {
+      const engine = new GameEngine(400);
+      engine.setMode(modeId);
+      engine.initGame(TEN("cannonball"), TEN("cannonball")); // wind-immune shell
+      expect(engine.getSnapshot().wind === 0 || modeId !== "lunar").toBe(true);
+      engine.setAngle(45);
+      engine.setPower(40);
+      engine.fire();
+      let maxX = 0;
+      for (let i = 0; i < 2400; i++) {
+        engine.advance(1 / 120);
+        for (const p of engine.getProjectiles()) maxX = Math.max(maxX, p.x);
+        if (i > 120 && engine.getProjectiles().length === 0) break;
+      }
+      return maxX;
+    };
+    expect(maxFlightX("lunar")).toBeGreaterThan(maxFlightX("classic") + 100);
+  });
+
+  it("Heavy Metal quick start deals only premium weapons", () => {
+    const engine = new GameEngine(3);
+    engine.setMode("heavy");
+    engine.quickStart();
+    const snap = engine.getSnapshot();
+    expect(snap.p1Weapons.length).toBe(10);
+    for (const id of [...snap.p1Weapons, ...snap.p2Weapons]) {
+      expect(PREMIUM_POOL).toContain(id);
+    }
   });
 });
 

@@ -31,7 +31,7 @@ export class Physics {
    * massScale > 1 = heavier: less wind drift. Gravity is mass-independent
    * (dividing it by mass made heavy shells FLOATY — the opposite of heavy).
    */
-  static stepProjectile(p: ProjectileState, wind: number, dt: number): void {
+  static stepProjectile(p: ProjectileState, wind: number, dt: number, gravity: number = PHYSICS.GRAVITY): void {
     // Save previous position for swept collision
     p.prevX = p.x;
     p.prevY = p.y;
@@ -41,7 +41,7 @@ export class Physics {
 
     // Update velocity (semi-implicit Euler)
     p.vx += windAccel * dt;
-    p.vy -= PHYSICS.GRAVITY * dt;
+    p.vy -= gravity * dt;
 
     // Update position with new velocity
     p.x += p.vx * dt;
@@ -133,6 +133,7 @@ export class Physics {
     massScale = 1,
     steps = 80,
     dt = 1 / 60,
+    gravity: number = PHYSICS.GRAVITY,
   ): { x: number; y: number }[] {
     const { vx, vy } = this.computeVelocity(angleDeg, power);
     const points: { x: number; y: number }[] = [];
@@ -144,7 +145,7 @@ export class Physics {
     for (let i = 0; i < steps; i++) {
       const windAccel = (wind * PHYSICS.WIND_SCALE) / massScale;
       pvx += windAccel * dt;
-      pvy -= PHYSICS.GRAVITY * dt;
+      pvy -= gravity * dt;
       px += pvx * dt;
       py += pvy * dt;
       points.push({ x: px, y: py });

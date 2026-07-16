@@ -33,6 +33,7 @@ const EMPTY_SNAPSHOT: GameSnapshot = {
   phase: "DRAFT",
   round: 1,
   maxRounds: 10,
+  modeName: "Classic Battle",
   currentPlayer: 0,
   wind: 0,
   p1Score: 0,

@@ -29,11 +29,15 @@ function assertWorldSane(engine: GameEngine, context: string): void {
   }
 }
 
-describe("stress: full random-arsenal matches stay sane", () => {
+const MODE_IDS = ["classic", "blitz", "lunar", "heavy"];
+
+describe("stress: full random-arsenal matches stay sane (all battle modes)", () => {
   for (const seed of SEEDS) {
-    it(`seed ${seed}: match completes, world stays valid on every shot`, () => {
+    const modeId = MODE_IDS[seed % MODE_IDS.length];
+    it(`seed ${seed} [${modeId}]: match completes, world stays valid on every shot`, () => {
       const engine = new GameEngine(seed);
-      engine.quickStart(); // random 10-weapon arsenal per player from the full pool
+      engine.setMode(modeId);
+      engine.quickStart(); // random 10-weapon arsenal per player from the mode's pool
 
       // Vary the aim deterministically per shot so different weapons
       // land short/long/high across the match
@@ -59,9 +63,10 @@ describe("stress: full random-arsenal matches stay sane", () => {
       }
 
       const final = engine.getSnapshot();
+      const volleys = engine.getMode().volleys;
       expect(final.phase, `seed ${seed}: match must complete`).toBe("GAME_OVER");
-      expect(final.round).toBe(WORLD.MAX_VOLLEYS);
-      expect(shotIdx).toBe(WORLD.MAX_VOLLEYS * 2);
+      expect(final.round).toBe(volleys);
+      expect(shotIdx).toBe(volleys * 2);
       expect([0, 1, -1]).toContain(final.winner);
     });
   }

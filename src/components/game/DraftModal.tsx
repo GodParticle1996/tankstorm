@@ -11,7 +11,15 @@
 import { useEffect, useRef, useState } from "react";
 import { getEngine } from "../../game/GameStore";
 import { getWeapon, DRAFT_POOL, PREMIUM_POOL } from "../../game/engine/weapons";
+import { MODES } from "../../game/engine/modes";
 import { WeaponIcon, PlayIcon, TankLogo } from "./icons";
+
+const MODE_COLORS: Record<string, string> = {
+  classic: "#3b82f6",
+  blitz: "#22d3ee",
+  lunar: "#a5b4fc",
+  heavy: "#f97316",
+};
 
 const TOTAL_ROUNDS = 5;
 const CARDS_PER_DEAL = 6;
@@ -29,8 +37,12 @@ function shuffled<T>(arr: readonly T[]): T[] {
   return a;
 }
 
-/** Deal 6 cards: ≥2 premium, no repeats of anything already picked by either player */
-function dealCards(taken: ReadonlySet<string>): string[] {
+/** Deal 6 cards: ≥2 premium (ALL premium in Heavy Metal mode), no repeats
+ *  of anything already picked by either player */
+function dealCards(taken: ReadonlySet<string>, premiumOnly: boolean): string[] {
+  if (premiumOnly) {
+    return shuffled(PREMIUM_POOL.filter((id) => !taken.has(id))).slice(0, CARDS_PER_DEAL);
+  }
   const premium = shuffled(PREMIUM_POOL.filter((id) => !taken.has(id)));
   const rest = shuffled(DRAFT_POOL.filter((id) => !taken.has(id) && !premium.slice(0, PREMIUM_PER_DEAL).includes(id)));
   const deal = [
@@ -46,8 +58,9 @@ function dealCards(taken: ReadonlySet<string>): string[] {
 }
 
 /** 5 hidden weapons: distinct within a player, may duplicate across players */
-function hiddenWeapons(owned: readonly string[]): string[] {
-  const pool = shuffled(DRAFT_POOL.filter((id) => !owned.includes(id)));
+function hiddenWeapons(owned: readonly string[], premiumOnly: boolean): string[] {
+  const basePool = premiumOnly ? PREMIUM_POOL : DRAFT_POOL;
+  const pool = shuffled(basePool.filter((id) => !owned.includes(id)));
   return pool.slice(0, HIDDEN_WEAPONS);
 }
 
@@ -69,6 +82,8 @@ interface DraftState {
   picks: [string[], string[]];
   /** The 6 dealt cards for the current round */
   deal: string[];
+  /** Heavy Metal mode: every deal comes from the premium pool */
+  premiumOnly: boolean;
   /** Re-entry lock: set true the instant a pick is accepted; cleared on the
    *  next commit so the second picker (or next round) can act. The cards
    *  derive their `disabled` prop from this for immediate visual feedback,
@@ -82,18 +97,29 @@ function pickPickerFor(s: DraftState): 0 | 1 {
   return s.pickInRound === 0 ? firstPicker : firstPicker === 0 ? 1 : 0;
 }
 
-function initialDraftState(): DraftState {
+function initialDraftState(premiumOnly: boolean): DraftState {
   return {
     round: 1,
     pickInRound: 0,
     picks: [[], []],
-    deal: dealCards(new Set()),
+    deal: dealCards(new Set(), premiumOnly),
+    premiumOnly,
     locked: false,
   };
 }
 
 export function DraftModal() {
-  const [state, setState] = useState<DraftState>(initialDraftState);
+  // Stage 1: pick the battle mode. Stage 2: draft weapons.
+  const [modeId, setModeId] = useState<string | null>(null);
+  const [state, setState] = useState<DraftState>(() => initialDraftState(false));
+
+  const selectMode = (id: string) => {
+    const mode = MODES.find((m) => m.id === id);
+    if (!mode || modeId !== null) return;
+    getEngine().setMode(id);
+    setState(initialDraftState(mode.premiumOnly));
+    setModeId(id);
+  };
 
   // Guarantees finishDraft / initGame runs at most once.
   const finishedRef = useRef(false);
@@ -101,12 +127,12 @@ export function DraftModal() {
   const currentPicker = pickPickerFor(state);
   const pickerColor = P_COLORS[currentPicker];
 
-  const finishDraft = (finalPicks: [string[], string[]]) => {
+  const finishDraft = (finalPicks: [string[], string[]], premiumOnly: boolean) => {
     if (finishedRef.current) return;
     finishedRef.current = true;
     const engine = getEngine();
-    const p1 = [...finalPicks[0], ...hiddenWeapons(finalPicks[0])];
-    const p2 = [...finalPicks[1], ...hiddenWeapons(finalPicks[1])];
+    const p1 = [...finalPicks[0], ...hiddenWeapons(finalPicks[0], premiumOnly)];
+    const p2 = [...finalPicks[1], ...hiddenWeapons(finalPicks[1], premiumOnly)];
     engine.initGame(p1, p2);
   };
 
@@ -147,7 +173,7 @@ export function DraftModal() {
       if (prev.round === TOTAL_ROUNDS) {
         // Schedule the handoff AFTER the state commit so the modal can
         // unmount cleanly. Exactly-once is enforced by finishedRef.
-        queueMicrotask(() => finishDraft(nextPicks));
+        queueMicrotask(() => finishDraft(nextPicks, prev.premiumOnly));
         return { ...prev, picks: nextPicks, locked: true };
       }
 
@@ -157,7 +183,7 @@ export function DraftModal() {
         picks: nextPicks,
         round: prev.round + 1,
         pickInRound: 0,
-        deal: dealCards(taken),
+        deal: dealCards(taken, prev.premiumOnly),
         locked: true,
       };
     });
@@ -198,6 +224,54 @@ export function DraftModal() {
       <div className="relative z-10 flex flex-col items-center min-h-full">
       <div className="w-full max-w-4xl px-6 py-8 flex flex-col items-center gap-5 shrink-0 my-auto">
 
+        {modeId === null ? (
+          <>
+            {/* ─── Stage 1: Battle mode select ─── */}
+            <div className="text-center flex flex-col items-center">
+              <div className="flex items-center gap-3 mb-3">
+                <TankLogo size={30} />
+                <span className="text-sm font-black tracking-[0.25em] text-white/50">TANKSTORM</span>
+              </div>
+              <h2 className="text-3xl font-black text-gradient">CHOOSE YOUR BATTLE</h2>
+              <p className="text-xs text-white/35 mt-1">Each mode changes gravity, wind, volleys and the battlefield itself</p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-3xl">
+              {MODES.map((mode) => {
+                const color = MODE_COLORS[mode.id] ?? "#3b82f6";
+                return (
+                  <button
+                    key={mode.id}
+                    data-mode-card
+                    onClick={() => selectMode(mode.id)}
+                    className="group text-left rounded-2xl p-5 transition-all hover:scale-[1.02] active:scale-95"
+                    style={{
+                      background: "rgba(255,255,255,0.045)",
+                      border: `1px solid ${color}44`,
+                      boxShadow: `0 0 22px ${color}14`,
+                    }}
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-lg font-black" style={{ color }}>{mode.name}</span>
+                      <span className="w-2.5 h-2.5 rounded-full" style={{ background: color, boxShadow: `0 0 8px ${color}` }} />
+                    </div>
+                    <p className="text-xs text-white/45 mb-3">{mode.tagline}</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {mode.perks.map((perk) => (
+                        <span key={perk} className="text-[10px] px-2 py-0.5 rounded-full text-white/60"
+                          style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.08)" }}>
+                          {perk}
+                        </span>
+                      ))}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </>
+        ) : (
+          <>
+
         {/* Header */}
         <div className="text-center flex flex-col items-center">
           <div className="flex items-center gap-3 mb-3">
@@ -206,6 +280,11 @@ export function DraftModal() {
           </div>
           <p className="text-[11px] tracking-[0.3em] text-white/40 font-semibold mb-1">
             WEAPON DRAFT
+            {modeId && (
+              <span style={{ color: MODE_COLORS[modeId] }}>
+                {" · "}{MODES.find((m) => m.id === modeId)?.name.toUpperCase()}
+              </span>
+            )}
           </p>
           <h2 className="text-3xl font-black" style={{ color: pickerColor }}>
             PLAYER {currentPicker + 1} PICKS
@@ -309,6 +388,8 @@ export function DraftModal() {
         >
           <PlayIcon size={13} /> Skip draft — random arsenals
         </button>
+          </>
+        )}
       </div>
       </div>
     </div>

@@ -17,8 +17,10 @@ describe("Terrain.carveCrater", () => {
     expect(t.getSurfaceY(500)).toBeCloseTo(150, 0);
     // Just inside the rim it is barely lowered
     expect(t.getSurfaceY(455)).toBeGreaterThan(170);
-    // Outside the radius nothing changes
-    expect(t.getSurfaceY(560)).toBeCloseTo(200, 5);
+    // Just outside the crater the RIM is raised (ejected dirt)
+    expect(t.getSurfaceY(560)).toBeGreaterThan(200);
+    // Well beyond the rim band nothing changes
+    expect(t.getSurfaceY(650)).toBeCloseTo(200, 5);
   });
 
   it("clamps at the terrain floor", () => {
@@ -49,6 +51,48 @@ describe("Terrain.buildTerrain", () => {
     t.buildTerrain(500, 40, 1000, "pillar");
     expect(t.getSurfaceY(500)).toBeLessThanOrEqual(WORLD.TERRAIN_CEIL_Y);
     expect(t.getSurfaceY(500)).toBeGreaterThan(400);
+  });
+});
+
+describe("landslide relaxation (angle of repose)", () => {
+  it("slumps steep crater walls until no slope exceeds the repose angle", () => {
+    const t = flatTerrain(300);
+    t.carveCrater(500, 300, 60); // deep crater with near-vertical walls
+    expect(t.relaxing).toBe(true);
+
+    let guard = 0;
+    while (t.relaxStep(1 / 120) && guard++ < 120 * 10) { /* run to rest */ }
+    expect(t.relaxing).toBe(false);
+
+    for (let i = 0; i < t.cols - 1; i++) {
+      const diff = Math.abs(t.surfaceY[i] - t.surfaceY[i + 1]);
+      expect(diff, `adjacent slope at col ${i}`).toBeLessThanOrEqual(2.0);
+    }
+  });
+
+  it("conserves mass while sliding (transfers, not deletions)", () => {
+    const t = flatTerrain(250);
+    t.carveCrater(500, 250, 40);
+    const before = t.surfaceY.reduce((a, b) => a + b, 0);
+    let guard = 0;
+    while (t.relaxStep(1 / 120) && guard++ < 1200) { /* settle */ }
+    const after = t.surfaceY.reduce((a, b) => a + b, 0);
+    expect(Math.abs(after - before)).toBeLessThan(1);
+  });
+
+  it("throws ejected dirt onto a raised rim outside the crater", () => {
+    const t = flatTerrain(200);
+    t.carveCrater(500, 200, 50);
+    const rimY = Math.max(t.getSurfaceY(442), t.getSurfaceY(558));
+    expect(rimY).toBeGreaterThan(200);
+  });
+
+  it("never runs longer than its hard time cap", () => {
+    const t = flatTerrain(300);
+    t.carveCrater(500, 300, 90);
+    let steps = 0;
+    while (t.relaxStep(1 / 120)) steps++;
+    expect(steps).toBeLessThanOrEqual(120 * 3.6);
   });
 });
 

@@ -18,6 +18,20 @@ export class Terrain {
   /** Dirty flag — set when terrain is modified, cleared by renderer after mesh update */
   dirty = true;
 
+  // ─── Landslide (angle-of-repose) relaxation state ───
+  /** true while loose dirt is still sliding — the turn waits for it */
+  relaxing = false;
+  private relaxTime = 0;
+  private relaxLo = 0;
+  private relaxHi = 0;
+  /** World X of the strongest slide this step (for dust effects) */
+  lastSlideX = 0;
+
+  /** Max height difference between adjacent columns before dirt slides (~55°) */
+  private static readonly REPOSE_DIFF = 1.5;
+  /** Landslides never run longer than this per shot (watchdog-friendly) */
+  private static readonly RELAX_MAX_SECONDS = 3.5;
+
   constructor(cols = WORLD.TERRAIN_COLS) {
     this.cols = cols;
     this.worldWidth = WORLD.WIDTH;
@@ -154,6 +168,71 @@ export class Terrain {
     return Math.atan2(yR - yL, dx * 2) * (180 / Math.PI);
   }
 
+  // ─── Landslide relaxation (§realistic collapse) ───
+
+  /**
+   * Mark a region of columns as disturbed so loose dirt starts sliding.
+   * Regions from multiple impacts merge. Builds deliberately do NOT call
+   * this — player-built walls stand until something disturbs them.
+   */
+  startRelax(startCol: number, endCol: number): void {
+    const lo = Math.max(0, startCol - 8);
+    const hi = Math.min(this.cols - 1, endCol + 8);
+    if (this.relaxing) {
+      this.relaxLo = Math.min(this.relaxLo, lo);
+      this.relaxHi = Math.max(this.relaxHi, hi);
+    } else {
+      this.relaxLo = lo;
+      this.relaxHi = hi;
+      this.relaxing = true;
+    }
+    this.relaxTime = 0; // fresh disturbance keeps the slide alive
+  }
+
+  /**
+   * One fixed-dt landslide step: any adjacent column pair steeper than the
+   * angle of repose transfers height downhill, animating a natural slump
+   * instead of the old instant snap. Deterministic (no RNG). Returns true
+   * while dirt is still moving.
+   */
+  relaxStep(dt: number): boolean {
+    if (!this.relaxing) return false;
+    this.relaxTime += dt;
+
+    const s = this.surfaceY;
+    const maxFlow = 55 * dt; // world units of height a pair can exchange per second
+    let moved = 0;
+    let biggest = 0;
+
+    // Sweep the disturbed region; expand it as slides spread outward
+    let lo = this.relaxLo;
+    let hi = this.relaxHi;
+    for (let i = lo; i < hi; i++) {
+      const diff = s[i] - s[i + 1];
+      const excess = Math.abs(diff) - Terrain.REPOSE_DIFF;
+      if (excess <= 0) continue;
+      const amount = Math.min(excess * 0.5, maxFlow);
+      const dir = Math.sign(diff);
+      s[i] = this.clampY(s[i] - dir * amount);
+      s[i + 1] = this.clampY(s[i + 1] + dir * amount);
+      moved += amount;
+      if (amount > biggest) {
+        biggest = amount;
+        this.lastSlideX = (i + 0.5) * this.step;
+      }
+      if (i === lo && lo > 0) lo--;
+      if (i === hi - 1 && hi < this.cols - 1) hi++;
+    }
+    this.relaxLo = lo;
+    this.relaxHi = hi;
+
+    if (moved > 0.001) this.dirty = true;
+    if (moved < 0.02 || this.relaxTime > Terrain.RELAX_MAX_SECONDS) {
+      this.relaxing = false;
+    }
+    return this.relaxing;
+  }
+
   // ─── Destruction / Modification ───
 
   private clampY(y: number): number {
@@ -171,6 +250,8 @@ export class Terrain {
     const startCol = Math.max(0, Math.floor((cx - r) / this.step));
     const endCol = Math.min(this.cols - 1, Math.ceil((cx + r) / this.step));
 
+    let removed = 0; // total height removed — a share is thrown onto the rim
+
     for (let i = startCol; i <= endCol; i++) {
       const px = i * this.step;
       const dx = px - cx;
@@ -184,10 +265,33 @@ export class Terrain {
 
       // If current surface is above the circle bottom, lower it
       if (this.surfaceY[i] > circleBottom) {
-        this.surfaceY[i] = this.clampY(circleBottom);
+        const clamped = this.clampY(circleBottom);
+        removed += this.surfaceY[i] - clamped;
+        this.surfaceY[i] = clamped;
       }
-    this.dirty = true;
     }
+
+    // Raised rim: ~12% of the ejected dirt lands just outside the crater
+    // edge with a smooth falloff (real craters have rims). The landslide
+    // relaxation then smooths anything too steep.
+    if (removed > 0) {
+      const rimWidth = Math.max(3, Math.round((r * 0.5) / this.step));
+      const rimPerSide = (removed * 0.12) / 2;
+      for (const dir of [-1, 1]) {
+        const edgeCol = dir === -1 ? startCol : endCol;
+        let weightSum = 0;
+        for (let k = 1; k <= rimWidth; k++) weightSum += rimWidth - k + 1;
+        for (let k = 1; k <= rimWidth; k++) {
+          const i = edgeCol + dir * k;
+          if (i < 0 || i >= this.cols) continue;
+          const weight = (rimWidth - k + 1) / weightSum;
+          this.surfaceY[i] = this.clampY(this.surfaceY[i] + rimPerSide * weight);
+        }
+      }
+    }
+
+    this.dirty = true;
+    this.startRelax(startCol, endCol);
   }
 
   /**
@@ -207,6 +311,7 @@ export class Terrain {
       this.surfaceY[i] = this.clampY(this.surfaceY[i] - depth);
     }
     this.dirty = true;
+    this.startRelax(startCol, endCol);
   }
 
   /**
@@ -224,8 +329,9 @@ export class Terrain {
         // Lower to the target depth (carve a pit)
         this.surfaceY[i] = Math.min(this.surfaceY[i], this.clampY(targetY));
       }
-    this.dirty = true;
     }
+    this.dirty = true;
+    this.startRelax(startCol, endCol);
   }
 
   /**
@@ -253,8 +359,12 @@ export class Terrain {
           this.surfaceY[i] = Math.min(this.surfaceY[i], this.clampY(cy));
         }
       }
-    this.dirty = true;
     }
+    this.dirty = true;
+    this.startRelax(
+      Math.max(0, Math.floor((Math.min(startX, endX) - width) / this.step)),
+      Math.min(this.cols - 1, Math.ceil((Math.max(startX, endX) + width) / this.step)),
+    );
   }
 
   /**

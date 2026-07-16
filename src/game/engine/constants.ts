@@ -19,7 +19,7 @@ export const WORLD = {
   TANK_FLATTEN_RADIUS: 40, // flatten terrain within this window around spawn
   MAX_MOVES: 4,
   MAX_VOLLEYS: 10, // each player fires 10 times
-  MOVE_SPEED: 5, // world units per move
+  MOVE_SPEED: 15, // world units per move (a small hop, 4 per match)
   MAX_SLOPE_DEG: 60, // refuse movement if slope exceeds this
   EDGE_BONUS: 25, // bonus for knocking tank off map edge
 } as const;

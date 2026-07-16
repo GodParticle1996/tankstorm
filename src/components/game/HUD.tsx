@@ -134,11 +134,14 @@ export function HUD() {
             </div>
           </div>
 
-          {/* Round */}
+          {/* Round + battle mode */}
           <div className="flex flex-col items-center px-4 border-x border-white/10">
             <div className="text-[10px] text-white/40 tracking-widest font-semibold">VOLLEY</div>
             <div className="text-xl font-bold text-white tabular-nums">
               {snap.round}<span className="text-white/30 text-sm">/{snap.maxRounds}</span>
+            </div>
+            <div className="text-[8px] text-white/30 tracking-[0.2em] font-semibold whitespace-nowrap">
+              {snap.modeName.toUpperCase()}
             </div>
           </div>
 
