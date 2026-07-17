@@ -6,7 +6,7 @@
 
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { getEngine, destroyEngine, useGameSnapshot } from "../game/GameStore";
+import { getEngine, useGameSnapshot } from "../game/GameStore";
 import { GameRenderer } from "../game/rendering/GameRenderer";
 import { InputManager } from "../game/input/InputManager";
 import { HUD } from "../components/game/HUD";
@@ -29,8 +29,17 @@ export default function Game() {
   useEffect(() => {
     if (!mountRef.current) return;
 
-    // Get or create engine singleton
+    // The engine is a PERMANENT singleton — never destroyed on unmount.
+    // Destroying + recreating it broke React's useSyncExternalStore
+    // subscriptions under StrictMode's double-mount (components stayed
+    // subscribed to the disposed instance and never saw initGame flip the
+    // phase — the draft appeared to hang forever in dev).
     const engine = getEngine();
+
+    // Fresh session: back to the DRAFT phase (mode select + weapon draft)
+    // and (re)start the fixed-timestep loop. Idempotent across
+    // StrictMode's mount → cleanup → mount cycle.
+    engine.reset();
 
     // Create renderer (reads engine directly, no React)
     const renderer = new GameRenderer(mountRef.current, engine);
@@ -41,11 +50,6 @@ export default function Game() {
     inputRef.current = input;
     input.start();
 
-    // Start the engine's simulation loop (fixed timestep).
-    // The engine begins in the DRAFT phase — the DraftModal (or its
-    // skip button) calls initGame/quickStart to begin the match.
-    engine.start();
-
     // Render loop (renderer reads engine state, runs at display refresh rate)
     const renderLoop = () => {
       renderer.render();
@@ -54,12 +58,12 @@ export default function Game() {
     rafRef.current = requestAnimationFrame(renderLoop);
 
     // ─── Cleanup (§Part 4 item 11 — prevent GPU leaks) ───
+    // Renderer/input are per-mount; the engine only pauses.
     return () => {
       cancelAnimationFrame(rafRef.current);
       input.stop();
       engine.stop();
       renderer.dispose();
-      destroyEngine();
     };
   }, []);
 

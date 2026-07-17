@@ -16,17 +16,19 @@ let engine: GameEngine | null = null;
 export function getEngine(): GameEngine {
   if (!engine) {
     engine = new GameEngine();
+    if (import.meta.env.DEV) {
+      // Dev-only escape hatch for debugging/inspection from the console
+      (window as unknown as Record<string, unknown>).__tankstormEngine = engine;
+    }
   }
   return engine;
 }
 
-/** Destroy the engine (on route unmount) */
-export function destroyEngine(): void {
-  if (engine) {
-    engine.dispose();
-    engine = null;
-  }
-}
+// NOTE: there is deliberately NO destroyEngine(). The engine lives for the
+// whole app session; destroying and recreating it invalidates every
+// useSyncExternalStore subscription that captured the old instance's
+// subscribe/getSnapshot (StrictMode's double-mount made this a guaranteed
+// deadlock in dev). Route changes call engine.reset() / engine.stop() instead.
 
 // ─── Empty snapshot for SSR/initial ───
 const EMPTY_SNAPSHOT: GameSnapshot = {
